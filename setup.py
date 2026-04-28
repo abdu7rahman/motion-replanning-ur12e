@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.rviz')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,9 +23,9 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            'reactive_replanning.py = reactive_replanning_ur12e.reactive_replanning:main',
-            'scene_setup.py        = reactive_replanning_ur12e.scene_setup:main',
-            'insert_obstacle.py    = reactive_replanning_ur12e.insert_obstacle:main',
+            'reactive_replanning = reactive_replanning_ur12e.reactive_replanning:main',
+            'scene_setup         = reactive_replanning_ur12e.scene_setup:main',
+            'insert_obstacle     = reactive_replanning_ur12e.insert_obstacle:main',
         ],
     },
 )
