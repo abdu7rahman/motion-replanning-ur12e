@@ -10,6 +10,7 @@ The arm runs a pick-and-place demo and routes around obstacles seen by the depth
 launch/reactive_replanning_full.launch.py   # full stack: bringup + MoveIt + RViz + scene
 config/reactive_replanning.rviz             # auto-loaded RViz with PointCloud2 + EEF path
 config/sensors_3d.yaml                      # OctoMap point-cloud updater config
+config/tuning.yaml                          # every parameter the node reads, with its default
 reactive_replanning_ur12e/
   reactive_replanning.py                    # main detection + replanning node
   scene_setup.py                            # static collision objects (floor)
@@ -75,22 +76,39 @@ ros2 run reactive_replanning_ur12e reactive_replanning
 
 When prompted, press ENTER to start the cycles. Move your hand into the workspace at any time to trigger detection and a replan.
 
-## Tuning knobs
+## Tuning
 
-All exposed as ROS parameters on the demo node:
+Everything is a ROS parameter. `config/tuning.yaml` carries the defaults and is
+loaded by the launch file; the node runs identically without it, because the
+class attributes it mirrors are the same values.
 
-| Parameter         | Default | What it controls                                                         |
-|-------------------|---------|--------------------------------------------------------------------------|
-| `pick_z_offset`   | -0.25   | Pick depth below home (meters)                                           |
-| `place_y_offset`  |  0.75   | Place horizontal offset from home                                        |
-| `vel_scale`       |  0.10   | Joint velocity scaling                                                   |
-| `acc_scale`       |  0.08   | Joint acceleration scaling (slightly < velocity for smoother ramps)      |
-| `ik_attempts`     |  120    | IK solutions to generate for the redundancy pool                         |
-| `ik_pool_size`    |  8      | How many IK candidates to plan before picking the shortest               |
-| `max_traj_length` |  5.0    | Joint-space length (rad) above which an IK plan gets rejected            |
-| `short_path_eps`  |  3.5    | First IK plan shorter than this exits the search early                   |
+```bash
+ros2 launch reactive_replanning_ur12e reactive_replanning.launch.py \
+  params_file:=/path/to/my_cell.yaml
 
-Class-level constants for filter geometry are at the top of `ReactiveReplannerUR12e` in `reactive_replanning.py` (`WS_X/Y/Z_MIN/MAX`, `ARM_SEG_RADIUS`, `ARM_JOINT_RADIUS`, `EEF_GUARD_RADIUS`, `SPHERE_RADIUS`, `PATH_CLEARANCE`, color thresholds).
+# or override one thing without a file
+ros2 run reactive_replanning_ur12e reactive_replanning \
+  --ros-args -p preempt_dist:=0.28 -p ws_z_min:=0.05
+```
+
+The pick and place poses are not coordinates. `compute_home_fk()` asks MoveIt
+for the EEF pose at `HOME_JOINTS` and `_build_poses()` offsets it, so they
+follow the robot rather than assuming where it is bolted down.
+
+| Group | Parameters | What it controls |
+|---|---|---|
+| Task | `pick_z_offset`, `place_y_offset` | Where the pick and place sit relative to the home EEF pose |
+| Planning | `ik_attempts`, `ik_pool_size`, `max_traj_length`, `short_path_eps`, `vel_scale`, `acc_scale` | Size of the IK redundancy search and how aggressively it settles for a short path |
+| Camera | `depth_min`, `depth_max`, `cloud_throttle` | Depth gate in the optical frame, and how often frames are processed |
+| Workspace | `ws_x_min/max`, `ws_y_min/max`, `ws_z_min/max` | The box in `base_link` that counts. **Re-measure these when the cell moves** — outside it is the pedestal, the floor and whoever is standing behind the robot |
+| Self-filter | `use_color_filter`, `color_gray_sum`, `color_gray_diff`, `color_black_sum`, `arm_seg_radius`, `arm_joint_radius`, `eef_guard_radius`, `arm_link_pairs` | Telling the robot apart from everything else. The colour numbers are for this arm's housing under this lighting |
+| Detection | `obstacle_threshold`, `debounce_frames`, `obstacle_ttl`, `obstacle_move_eps`, `sphere_radius` | How many surviving points count as an obstacle, and how long it persists |
+| Reaction | `preempt_dist`, `warn_dist`, `path_clearance`, `decel_wait`, `max_replan_depth`, `detour_height` | When a motion is cancelled mid-execution and what happens next |
+
+The self-filter geometry is still a hand-written capsule model rather than
+something read out of the URDF — `arm_link_pairs` makes the chain configurable,
+but the radii are two numbers for an arm whose links are not all the same
+thickness. That is the next thing worth fixing here.
 
 ## Notes
 

@@ -73,6 +73,13 @@ class ReactiveReplannerUR12e(Node):
         self.declare_parameter('max_traj_length', 5.0)   # rad — reject IK plans longer than this
         self.declare_parameter('ik_pool_size',    8)     # how many IK candidates to plan before picking shortest
         self.declare_parameter('short_path_eps',  3.5)   # rad — first plan shorter than this wins immediately
+
+        # Everything the detector and the reaction are tuned with is a
+        # parameter too. The class constants below stay as the defaults, so the
+        # node runs with no parameter file and the offline harnesses can still
+        # read them without a ROS graph -- but nothing here needs a source edit
+        # to move the robot, re-aim the camera or re-tune a threshold.
+        self._declare_tuning()
         self._current_goal_pose: Optional[Pose] = None
 
         self.current_joint_state = None
@@ -170,6 +177,47 @@ class ReactiveReplannerUR12e(Node):
         deadline = time.time() + timeout_sec
         while not fut.done() and time.time() < deadline:
             time.sleep(0.01)
+
+    # Every tuning constant, exposed. The name is the class attribute; the
+    # parameter is its lower-case form, so PREEMPT_DIST is preempt_dist.
+    TUNING = (
+        'DEPTH_MIN', 'DEPTH_MAX', 'OBSTACLE_THRESHOLD',
+        'USE_COLOR_FILTER', 'COLOR_GRAY_SUM', 'COLOR_GRAY_DIFF', 'COLOR_BLACK_SUM',
+        'SPHERE_RADIUS', 'PATH_CLEARANCE',
+        'WS_X_MIN', 'WS_X_MAX', 'WS_Y_MIN', 'WS_Y_MAX', 'WS_Z_MIN', 'WS_Z_MAX',
+        'CLOUD_THROTTLE', 'DETOUR_HEIGHT', 'DEBOUNCE_FRAMES', 'OBSTACLE_TTL',
+        'EEF_GUARD_RADIUS', 'OBSTACLE_MOVE_EPS', 'PREEMPT_DIST', 'WARN_DIST',
+        'DECEL_WAIT', 'MAX_REPLAN_DEPTH',
+        'ARM_SEG_RADIUS', 'ARM_JOINT_RADIUS',
+    )
+
+    def _declare_tuning(self):
+        """Bind every entry in TUNING to a parameter, defaulting to the constant.
+
+        Set on the instance rather than the class so two nodes in one process
+        cannot tread on each other, and so the class attribute stays readable as
+        the documented default.
+        """
+        for name in self.TUNING:
+            default = getattr(type(self), name)
+            self.declare_parameter(name.lower(), default)
+            setattr(self, name, self.get_parameter(name.lower()).value)
+
+        # the self-filter chain, as flat from/to pairs so it survives a YAML
+        # round trip; the arm is a different arm on a different cell
+        flat = [x for pair in type(self).ARM_LINK_PAIRS for x in pair]
+        self.declare_parameter('arm_link_pairs', flat)
+        got = list(self.get_parameter('arm_link_pairs').value)
+        if len(got) % 2:
+            self.get_logger().error(
+                'arm_link_pairs needs an even number of names; keeping the default')
+        else:
+            self.ARM_LINK_PAIRS = tuple(zip(got[0::2], got[1::2]))
+
+        self.get_logger().info(
+            f'{len(self.TUNING) + 1} tuning parameters declared; '
+            f'workspace box x[{self.WS_X_MIN}, {self.WS_X_MAX}] '
+            f'y[{self.WS_Y_MIN}, {self.WS_Y_MAX}] z[{self.WS_Z_MIN}, {self.WS_Z_MAX}]')
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
