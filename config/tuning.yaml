@@ -1,0 +1,79 @@
+# Everything the node is tuned with, in one place.
+#
+# These are the defaults the class already carries -- the node runs identically
+# with this file absent. It exists so that moving the robot, re-aiming the
+# camera or re-tuning a threshold is a config change rather than a source edit.
+#
+#   ros2 run reactive_replanning_ur12e reactive_replanning \
+#     --ros-args --params-file config/tuning.yaml
+
+/**:
+  ros__parameters:
+
+    # ── where the pick and place are, relative to the home EEF pose ──
+    # The poses themselves come from FK at home_joints; these only offset it.
+    pick_z_offset:   -0.25      # m, down from home
+    place_y_offset:   0.75      # m, across from home
+    ik_attempts:      120
+    ik_pool_size:     8         # IK candidates planned before picking the shortest
+    max_traj_length:  5.0       # rad, reject plans longer than this
+    short_path_eps:   3.5       # rad, first plan under this wins immediately
+    vel_scale:        0.10
+    acc_scale:        0.08
+
+    # ── camera ──────────────────────────────────────────────────────
+    depth_min:        0.4       # m, camera optical frame
+    depth_max:        2.5
+    cloud_throttle:   0.05      # s between processed frames
+
+    # ── the volume that counts as the workspace, in base_link ────────
+    # Anything outside is the pedestal, the floor, background, or a person
+    # standing behind the cell. Re-measure these when the cell moves.
+    ws_x_min:        -1.10
+    ws_x_max:        -0.30
+    ws_y_min:        -0.45
+    ws_y_max:         0.55
+    ws_z_min:         0.10
+    ws_z_max:         1.10
+
+    # ── telling the robot apart from everything else ─────────────────
+    # Colour thresholds are for this arm's housing; a different arm, a
+    # different paint job, or different lighting all want different numbers.
+    use_color_filter:  true
+    color_gray_sum:    400      # R+G+B above this, with similar channels, is gray
+    color_gray_diff:   35       # max channel spread still called gray
+    color_black_sum:   90       # R+G+B below this is black
+    arm_seg_radius:    0.12     # m, tube around the link shafts
+    arm_joint_radius:  0.15     # m, sphere at each joint housing
+    eef_guard_radius:  0.16     # m, the gripper extending past tool0
+    # The chain the self-filter sweeps, as flat from/to pairs.
+    arm_link_pairs:
+      - base_link
+      - shoulder_link
+      - shoulder_link
+      - upper_arm_link
+      - upper_arm_link
+      - forearm_link
+      - forearm_link
+      - wrist_1_link
+      - wrist_1_link
+      - wrist_2_link
+      - wrist_2_link
+      - wrist_3_link
+      - wrist_3_link
+      - tool0
+
+    # ── deciding something is there ─────────────────────────────────
+    obstacle_threshold:  120    # foreign points left after every filter
+    debounce_frames:     2      # consecutive frames over threshold before injecting
+    obstacle_ttl:        0.8    # s, drop the sphere if it stops being seen
+    obstacle_move_eps:   0.03   # m, how far it moves before the sphere follows
+    sphere_radius:       0.12   # m, the collision object handed to the planner
+
+    # ── reacting to it ──────────────────────────────────────────────
+    preempt_dist:        0.20   # m, EEF this close cancels the motion and replans
+    warn_dist:           0.30   # m, log only
+    path_clearance:      0.02   # m, buffer past the sphere for the path check
+    decel_wait:          2.0    # s, let the arm stop before replanning
+    max_replan_depth:    2      # cap on recursive mid-execution replans
+    detour_height:       0.22   # m, arc height for the last-resort cartesian detour
