@@ -1,0 +1,131 @@
+{
+ "by_size": [
+  {
+   "radius_m": 0.02,
+   "trials": 40,
+   "detected": 0,
+   "detect_rate": 0.0,
+   "latency_s": null,
+   "centroid_err_mm": null
+  },
+  {
+   "radius_m": 0.03,
+   "trials": 40,
+   "detected": 0,
+   "detect_rate": 0.0,
+   "latency_s": null,
+   "centroid_err_mm": null
+  },
+  {
+   "radius_m": 0.04,
+   "trials": 40,
+   "detected": 40,
+   "detect_rate": 1.0,
+   "latency_s": 0.1,
+   "centroid_err_mm": 2.3
+  },
+  {
+   "radius_m": 0.06,
+   "trials": 40,
+   "detected": 40,
+   "detect_rate": 1.0,
+   "latency_s": 0.1,
+   "centroid_err_mm": 2.1
+  },
+  {
+   "radius_m": 0.08,
+   "trials": 40,
+   "detected": 40,
+   "detect_rate": 1.0,
+   "latency_s": 0.1,
+   "centroid_err_mm": 2.1
+  },
+  {
+   "radius_m": 0.1,
+   "trials": 40,
+   "detected": 40,
+   "detect_rate": 1.0,
+   "latency_s": 0.1,
+   "centroid_err_mm": 2.1
+  }
+ ],
+ "by_points": [
+  {
+   "points": 60,
+   "detect_rate": 0.0
+  },
+  {
+   "points": 100,
+   "detect_rate": 0.0
+  },
+  {
+   "points": 130,
+   "detect_rate": 1.0
+  },
+  {
+   "points": 160,
+   "detect_rate": 1.0
+  },
+  {
+   "points": 220,
+   "detect_rate": 1.0
+  },
+  {
+   "points": 400,
+   "detect_rate": 1.0
+  }
+ ],
+ "false_positives": {
+  "frames": 300,
+  "spurious_detections": 0
+ },
+ "self_filter": [
+  {
+   "dist_m": 0.08,
+   "detect_rate": 0.0
+  },
+  {
+   "dist_m": 0.1,
+   "detect_rate": 0.0
+  },
+  {
+   "dist_m": 0.11,
+   "detect_rate": 0.76
+  },
+  {
+   "dist_m": 0.12,
+   "detect_rate": 1.0
+  },
+  {
+   "dist_m": 0.13,
+   "detect_rate": 1.0
+  },
+  {
+   "dist_m": 0.14,
+   "detect_rate": 1.0
+  },
+  {
+   "dist_m": 0.16,
+   "detect_rate": 1.0
+  },
+  {
+   "dist_m": 0.2,
+   "detect_rate": 1.0
+  },
+  {
+   "dist_m": 0.3,
+   "detect_rate": 1.0
+  }
+ ],
+ "colour_filter": {
+  "skin_kept": 0.923,
+  "robot_rejected": 0.85475
+ },
+ "throughput": {
+  "points_per_frame": 3770,
+  "median_ms": 2.47,
+  "p95_ms": 2.73,
+  "budget_ms": 50.0,
+  "headroom_x": 20.2
+ }
+}
