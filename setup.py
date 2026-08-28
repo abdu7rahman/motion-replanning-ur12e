@@ -7,7 +7,11 @@ package_name = 'reactive_replanning_ur12e'
 setup(
     name=package_name,
     version='1.0.0',
-    packages=find_packages(exclude=['test']),
+    # predictive_replanning is standalone MuJoCo, not a ROS node -- excluded so
+    # `colcon build` does not pull mujoco into the ament install.
+    packages=find_packages(exclude=['test', 'tests', 'predictive_replanning',
+                                    'predictive_replanning.*', 'third_party',
+                                    'third_party.*']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),

@@ -1,2 +1,11 @@
 __pycache__/
 *.pyc
+
+# Standalone MuJoCo side of the repo. All three are derived or fetched, and all
+# three are large: the venv, the pinned upstream clones, and the meshes
+# converted out of them. `python -m predictive_replanning.assets` rebuilds
+# assets/ from third_party/, and assets/PROVENANCE.json records the commit and
+# SHA-256 each mesh came from, so what is not committed is still pinned.
+.venv/
+third_party/
+assets/
