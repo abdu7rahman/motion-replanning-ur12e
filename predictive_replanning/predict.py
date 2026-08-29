@@ -28,23 +28,32 @@ __author__ = "".join(
 
 import numpy as np
 
-from predictive_replanning.ur12e import link_frames
+from predictive_replanning.ur12e import fk_tcp_pos, link_frames
 
 
 def arm_points(q, per_link: int = 3):
-    """Points along the arm, with the link index each one rides on.
+    """Points along the arm *including the gripper*, with their link index.
 
     The index is what lets the replanner build a Jacobian for the point that is
-    actually in the way. Pushing the tool frame when the forearm is the thing
-    inside the obstacle moves the wrong part of the arm.
+    actually in the way: pushing the tool when the forearm is inside the
+    obstacle moves the wrong part of the arm.
+
+    The chain runs to the tool centre point, not to wrist_3. Stopping at the
+    wrist left the last 0.156 m of the robot -- the whole Hand-E, and whatever
+    it is holding -- invisible to the planner. That is the part furthest from
+    the base and nearest the obstacle during a carry, so the replanner was
+    blind exactly where it mattered and barely triggered at all: 1.2 replans
+    per run, with the path 1.002x nominal, against an obstacle sitting in the
+    corridor. The gripper rides on link 6, so its Jacobian columns are the full
+    six and a push applied there moves it.
     """
     frames = link_frames(q)
-    pts = [np.zeros(3)] + [T[:3, 3] for T in frames]
-    out, links = list(pts), list(range(len(pts)))
+    pts = [np.zeros(3)] + [T[:3, 3] for T in frames] + [fk_tcp_pos(q)]
+    out, links = list(pts), list(range(len(pts) - 1)) + [6]
     for j, (a, b) in enumerate(zip(pts, pts[1:])):
         for s in np.linspace(0.0, 1.0, per_link + 2)[1:-1]:
             out.append(a + s * (b - a))
-            links.append(j + 1)
+            links.append(min(j + 1, 6))
     return np.asarray(out), np.asarray(links)
 
 

@@ -51,6 +51,7 @@ from predictive_replanning.obstacle import Track, load_tracks, record_tracks, sa
 from predictive_replanning.predict import ObstacleTracker, arm_points, time_to_collision
 from predictive_replanning.replan import deform_minimal, soft_mask
 from predictive_replanning.task import pick_and_place, placed, solve
+from predictive_replanning.ur12e import fk_tcp_pos
 
 BASE_Z = 0.18                       # base_link height in the MJCF
 STRATEGIES = ("none", "reactive", "predictive")
@@ -83,16 +84,29 @@ def _model_for(radius: float):
 
 
 def carry_centre() -> tuple[np.ndarray, float, int]:
-    """Where the obstacle should wander, and how long a run lasts.
+    """The middle of the pick-to-place corridor, and how long a run lasts.
 
-    Computed from the nominal plan once so every track in a batch is drawn
-    against the same geometry, and so the tracks can be recorded before any
-    strategy runs.
+    This is the halfway point of the *transfer* specifically -- the straight
+    carry from above the cube to above the place table -- taken at the tool
+    centre point. Two earlier versions of this were wrong in ways that flattered
+    the results:
+
+      * it centred on the wrist origin rather than the TCP, so the hazard sat
+        15 cm behind the part of the arm carrying the cube;
+      * it averaged over every deformable waypoint, approach included, which
+        pulls the centre back toward the pick table and away from the carry.
+
+    Both put the obstacle off to one side of the work. Combined with a box wide
+    enough to manufacture headroom, "avoided" mostly meant "was never a threat",
+    and the comparison measured distance rather than replanning.
     """
     q_home = np.array([0.0, -1.2, 1.4, -1.6, -1.5708, 0.0])
-    traj, times, _, deformable, _ = solve(pick_and_place(), q_home)
-    carry = np.where(deformable)[0]
-    mid = arm_points(traj[carry[len(carry) // 2]])[0][6] + np.array([0.0, 0.0, BASE_Z])
+    phases = pick_and_place()
+    traj, times, _, _, _ = solve(phases, q_home)
+    names = [p.name for p in phases]
+    start = fk_tcp_pos(traj[(names.index("lift") + 1) * 14 - 1])
+    end = fk_tcp_pos(traj[(names.index("transfer") + 1) * 14 - 1])
+    mid = 0.5 * (start + end) + np.array([0.0, 0.0, BASE_Z])
     return mid, float(times[-1]), len(traj)
 
 
@@ -102,8 +116,12 @@ def make_tracks(n: int, *, dt: float = 0.02, radius: float = 0.07,
     """A batch of obstacle motions for a comparison. No seeds: drawn from the
     OS entropy pool, then replayed identically for every strategy."""
     mid, duration, _ = carry_centre()
+    # Tight around the corridor: the obstacle stays in the way rather than
+    # wandering somewhere the arm never goes. Narrow across the path (x, z) and
+    # free to slide along it (y), which is what a hand reaching into a transfer
+    # actually does.
     return record_tracks(n, steps=int(duration / dt) + 60, dt=dt, centre=mid,
-                         box_half=(0.45, 0.55, 0.30), radius=radius,
+                         box_half=(0.12, 0.22, 0.12), radius=radius,
                          theta=theta, sigma=sigma, meas_std=meas_std)
 
 

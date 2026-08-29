@@ -137,14 +137,15 @@ comparable.
 ![no replanning: the obstacle reaches the arm](docs/img/nominal.gif)
 
 No replanning. The arm picks the cube and carries it, the obstacle crosses the
-path, and surface clearance goes to **−0.0023 m** — contact. The cube still
+transfer, and surface clearance goes to **−0.0354 m** — contact. The cube still
 lands on the table, which is the point of scoring both things separately.
 
 ![predictive replanning at TTC 0.3 s](docs/img/predictive.gif)
 
-The same recorded obstacle motion with prediction on. Three replans, closest
-approach **+0.0392 m**, and the cube is placed. That is a success; the run
-above is not.
+The same recorded obstacle motion with prediction on. One replan, closest
+approach **+0.0684 m**, and the cube is placed. That is a success; the run
+above is not — and it is worth saying up front that only **2 of 120** tracks
+look like this. The aggregate below is the honest picture.
 
 ## The cell is the vendor's, not a sketch
 
@@ -229,45 +230,82 @@ dodges perfectly and drops the cube has failed at the job. Clearance is
 `mj_geomDistance`, surface-to-surface against UR's own collision meshes on the
 state the simulator actually reached; zero is touching.
 
-## Replanning improves avoidance and loses the job
+## Where the obstacle is
 
-120 recorded tracks, obstacle at 0.288 m/s RMS:
+In the middle of the pick-to-place corridor, at the halfway point of the
+transfer, taken at the tool centre point: (−0.62, 0.12, 0.61) in world frame.
+The box around it is tight — 0.12 m across the path, 0.22 m along it — so the
+obstacle stays in the way rather than wandering somewhere the arm never goes.
+
+Three earlier versions of this were wrong in ways that all flattered the
+result. It centred on the **wrist origin** rather than the TCP, putting the
+hazard 15 cm behind the part of the arm carrying the cube. It averaged over
+every deformable waypoint, approach included, which drags the centre back
+toward the pick table. And the box was opened to (0.45, 0.55, 0.30) to
+manufacture headroom, which mostly bought distance: "avoided" came to mean
+"was never a threat", and the comparison measured how far away the obstacle
+was rather than how well anything replanned.
+
+## The planner could not see its own gripper
+
+The skeleton the replanner checks stopped at wrist_3. The last **0.156 m** of
+the robot — the whole Hand-E, and whatever it is holding — was invisible to it:
+the part furthest from the base, and the part nearest the obstacle during a
+carry. Against an obstacle sitting in the corridor the replanner fired 1.2
+times a run and moved the path 1.002x nominal, which reads like a tuning
+problem and is not one.
+
+The chain now runs to the TCP. On the same recorded tracks that doubled the
+replan count and moved reactive from 84 to 86 successes.
+
+## Results, 120 recorded tracks
+
+Obstacle at 0.285 m/s RMS, in the corridor, same motions replayed for every row.
 
 | strategy | success | placed | never touched | min clearance | replans | path / nominal |
 |---|---|---|---|---|---|---|
-| none | **71/120** | 120/120 | 71/120 | 0.0002 m | 0 | 1.00x |
-| reactive | 61/120 | 96/120 | 77/120 | 0.0066 m | 2.8 | 1.17x |
-| predictive, TTC 0.5 s | 63/120 | 91/120 | **83/120** | **0.0073 m** | 4.2 | 1.29x |
+| none | **83/120** | 120/120 | 83/120 | 0.0225 m | 0 | 1.00x |
+| reactive | 86/120 | 117/120 | 88/120 | 0.0259 m | 2.3 | 1.03x |
+| predictive, TTC 0.3 s | 79/120 | 110/120 | 86/120 | 0.0291 m | 2.7 | 1.09x |
 
-Avoidance goes up — 71, 77, 83 runs untouched. Placement goes down — 120, 96,
-91. Net success goes **down**: doing nothing wins.
-
-That is not what the earlier version of this measured, and the difference is
-the grasp. An equality weld cannot drop a cube, so replanning appeared to cost
-only path length. A parallel jaw holding a box by friction can and does drop it
-when the carry is deformed hard enough.
-
-## And the horizon makes it worse, monotonically
+And across the horizon:
 
 | TTC | success | placed | never touched | min clearance | path / nominal |
 |---|---|---|---|---|---|
-| none | 71/120 | 120/120 | 71/120 | 0.0002 m | 1.00x |
-| **0.3 s** | **77/120** | 116/120 | 79/120 | 0.0052 m | 1.13x |
-| 0.5 s | 63/120 | 91/120 | 83/120 | 0.0073 m | 1.29x |
-| 1.0 s | 14/120 | 29/120 | 84/120 | 0.0132 m | 1.55x |
-| 2.0 s | 9/120 | 23/120 | 86/120 | 0.0157 m | 1.80x |
+| none | **83/120** | 120/120 | 83/120 | 0.0225 m | 1.00x |
+| 0.3 s | 79/120 | 110/120 | 86/120 | 0.0291 m | 1.09x |
+| 0.5 s | 70/120 | 96/120 | 85/120 | 0.0313 m | 1.23x |
+| 1.0 s | 36/120 | 47/120 | **95/120** | **0.0413 m** | 1.63x |
+| 2.0 s | 14/120 | 21/120 | 82/120 | 0.0369 m | 2.07x |
 
-Untouched climbs the whole way: 71, 79, 83, 84, 86. Placed collapses: 120, 116,
-91, **29**, 23. Success peaks at a **0.3 s** horizon — barely enough to react —
-and falls off a cliff.
+**No setting beats doing nothing.** Placement falls monotonically — 120, 110,
+96, 47, 21 — and success falls with it. At TTC 1.0 s the arm is untouched in 95
+runs against the baseline's 83, and it drops the cube in 73 of them.
 
-**Scored on collisions alone, TTC 2.0 s is the best row in the table.** Best
-clearance, fewest touches. It also drops the cube 97 times out of 120. The
-project proposal's own TTC < 2 s threshold is the worst setting measured here
-once the job is part of the score.
+## Is any of that real? Paired McNemar, n=120
 
-The useful version of the result: predict just far enough to move, and no
-further. Every additional 100 ms of lookahead buys clearance the task pays for.
+The tracks are paired, so the marginals above understate what can be tested.
+Counting the runs where exactly one of the two strategies succeeded:
+
+| comparison | baseline only | strategy only | p |
+|---|---|---|---|
+| reactive vs none, success | 1 | 4 | 0.375 |
+| predictive 0.3 s vs none, success | 6 | 2 | 0.289 |
+| **predictive 1.0 s vs none, success** | **53** | **6** | **<0.0001** |
+| reactive vs none, untouched | 0 | 5 | 0.063 |
+| predictive 0.3 s vs none, untouched | 0 | 3 | 0.250 |
+| **predictive 1.0 s vs none, untouched** | **8** | **20** | **0.036** |
+
+So the one statement this experiment supports at any confidence is a
+double-edged one: **at a 1 s horizon, predictive replanning is significantly
+better at avoiding the obstacle (p = 0.036) and significantly worse at the job
+(p < 0.0001).** Everything else — reactive, short-horizon prediction — is
+indistinguishable from doing nothing, and the tables above should be read that
+way rather than as a ranking.
+
+That is a negative result for the method as implemented here. It is also the
+result the project proposal's own framing could not have produced: scored on
+collisions alone, TTC 1.0 s is the best row in the table.
 
 ## Why looking further ahead stops helping
 
@@ -280,13 +318,11 @@ horizon. Mean forecast error against a 0.19 m tube:
 |---|---|---|---|---|
 | forecast error | 0.075 m | 0.123 m | 0.254 m | 0.529 m |
 
-Between 0.5 s and 1.0 s the prediction leaves the tube meant to contain it,
-which is the same place the success rate turns over.
-
-A constant-velocity filter also extrapolates without bound: its 2 s covariance
-implies a sphere 2.40 m across against a true mean error of 0.98 m. Inflating
-by that marks the whole workspace blocked, so the tube saturates at a cap the
-cell knows from its own obstacle bounds.
+Between 0.5 s and 1.0 s the prediction leaves the tube meant to contain it. A
+constant-velocity filter also extrapolates without bound: its 2 s covariance
+implies a sphere 2.40 m across against a true mean error of 0.98 m, which would
+mark the whole workspace blocked, so the tube saturates at a cap the cell knows
+from its own obstacle bounds.
 
 ## Moving as little as possible
 
@@ -311,19 +347,6 @@ reading code:
   fires every timestep, deformations compound, and the path reaches **45x**
   nominal.
 
-## Scenario sizing, stated
-
-The obstacle's box is centred on the middle of the carry and deliberately left
-wide. Wrapped tightly at (0.22, 0.30, 0.18) it sits on the arm almost
-continuously, the do-nothing baseline is touched 23 of 25 times, and no
-strategy recovers — a scenario with no feasible solution rather than a planning
-result. Opened to (0.45, 0.55, 0.30) with a 0.07 m obstacle the baseline clears
-roughly half, which is the range where strategies can differ at all.
-
-At n=25 they cannot: between-batch swings were as large as the gaps between
-strategies (17/14/16 on one batch, 11/13/10 on the next). Everything above is
-n=120 for that reason.
-
 ## Running it
 
 ```bash
@@ -335,8 +358,8 @@ git clone --depth 1 https://github.com/AGH-CEAI/robotiq_hande_description.git th
 .venv/bin/python -m predictive_replanning.assets        # DAE/STL -> MuJoCo, with provenance
 
 .venv/bin/python tests/test_predictive.py               # 34 checks
-.venv/bin/python -m predictive_replanning.run --trials 120 --ttc 0.3 --tracks tests/tracks/calm120.npz
-.venv/bin/python -m predictive_replanning.run --trials 120 --sweep-ttc 0.3,0.5,1.0,2.0 --tracks tests/tracks/calm120.npz
+.venv/bin/python -m predictive_replanning.run --trials 120 --ttc 0.3 --tracks tests/tracks/corridor120.npz
+.venv/bin/python -m predictive_replanning.run --trials 120 --sweep-ttc 0.3,0.5,1.0,2.0 --tracks tests/tracks/corridor120.npz
 .venv/bin/python -m predictive_replanning.run --trials 60 --save-tracks /tmp/new.npz   # fresh random motions
 ```
 
@@ -358,9 +381,9 @@ and `assets/PROVENANCE.json` pins what they came from.
 - **No perception.** The obstacle's position is read from the recorded track
   with Gaussian noise added. The RealSense pipeline above is not in this loop.
 - **The planner's collision check is a skeleton**, joint origins plus samples
-  down each shaft, because it runs over every future waypoint on every step.
-  Only the reported clearance uses the real meshes, so the planner is never
-  scored on its own simplification.
+  down each shaft to the TCP, because it runs over every future waypoint on
+  every step. Only the reported clearance uses the real meshes, so the planner
+  is never scored on its own simplification.
 - **One cube.** The other two are scenery.
 - **Strategy 3 is still not implemented.** CHOMP/TrajOpt-style local
   optimisation remains future work, as it was in the write-up.
