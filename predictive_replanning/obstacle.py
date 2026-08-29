@@ -190,3 +190,114 @@ def load_tracks(path) -> list[Track]:
     return [Track(positions=p, observations=o, dt=float(m[0]), radius=float(m[1]),
                   theta=float(m[2]), sigma=float(m[3]))
             for p, o, m in zip(z["positions"], z["observations"], z["meta"])]
+
+
+#: Velocity-tracking rate while closing. Higher than the loiter value so the
+#: obstacle achieves its commanded approach speed instead of lagging it.
+PURSUIT_THETA = 8.0
+#: Noise during the dart, as a fraction of the loiter noise. Enough that
+#: the approach is not a straight line the tracker could extrapolate in
+#: closed form, little enough that the obstacle reaches what it aimed at.
+PURSUIT_NOISE = 0.45
+
+
+def record_intercept_track(*, tcp_path, times, carry_mask, dt: int, steps: int,
+                           radius: float, theta: float, sigma: float,
+                           meas_std: float, rng: np.random.Generator | None = None,
+                           standoff=(0.30, 0.50), approach=(1.2, 2.0)) -> Track:
+    """An obstacle that goes for the arm on purpose.
+
+    A random walk in a box only wanders into the path some of the time, so most
+    trials never posed a conflict at all and the comparison measured how often
+    the obstacle happened to be elsewhere. Worse, it gave the predictor nothing
+    worth predicting: a mean-reverting wander has no intent to estimate, so the
+    filter's velocity carried almost no information about where the obstacle
+    would be when it mattered.
+
+    This one picks a waypoint on the arm's own planned path, works out when the
+    arm will be there, and sets off from a standoff distance so as to arrive at
+    the same place at the same time. Every trial is therefore a real conflict,
+    and the obstacle has a genuine closing velocity -- which is exactly the
+    quantity a constant-velocity filter exists to estimate.
+
+    It waits before it moves. Setting off at t=0 meant creeping in at 0.08 m/s
+    over six seconds, and integrated OU noise over that long is several times
+    the standoff -- the obstacle drifted off its own aim and arrived 0.09 to
+    0.16 m wide, so half the trials still posed no conflict. Loitering and then
+    closing over a second or two is both what a hand does and short enough that
+    the noise cannot swamp the approach.
+
+    It is still random in the ways that matter: which waypoint it aims at, which
+    direction it comes from, how far it starts, how long it takes to close, and
+    OU noise the whole way, so it neither travels in a straight line nor arrives
+    exactly where it aimed. What is no longer random is whether there is
+    anything to avoid.
+    """
+    rng = rng or np.random.default_rng()
+    tcp_path = np.asarray(tcp_path, float)
+    times = np.asarray(times, float)
+    carry = np.where(np.asarray(carry_mask, bool))[0]
+
+    # Aim at a point in the middle of the carry, away from the very ends where
+    # the arm is still leaving the bench or already over the target.
+    lo, hi = int(0.20 * len(carry)), int(0.85 * len(carry))
+    k = int(carry[rng.integers(lo, max(lo + 1, hi))])
+    aim = tcp_path[k]
+    t_hit = float(times[k])
+    _ = aim              # kept for readability; the pursuit re-aims each step
+
+    # Come in from a random direction, mostly horizontal: a hand reaches across
+    # a cell, it does not drop out of the ceiling.
+    u = rng.normal(size=3)
+    u[2] *= 0.35
+    u /= np.linalg.norm(u)
+    start = aim + u * float(rng.uniform(*standoff))
+
+    t_close = float(rng.uniform(*approach))
+    t_go = max(0.0, t_hit - t_close)
+
+    proc = ObstacleProcess(centre=start, box_half=np.array([2.0, 2.0, 2.0]),
+                           theta=theta, sigma=sigma * 0.25, radius=radius, rng=rng)
+    proc.pos = start.copy()
+    proc.mu = np.zeros(3)
+    proc.vel = np.zeros(3)
+
+    pos = np.empty((steps, 3))
+    closing = False
+    for s in range(steps):
+        t = s * dt
+        if t >= t_go and t <= t_hit:
+            # Pursue, rather than fire once at a predicted point. A single
+            # aimed shot missed by 0.11 to 0.16 m once OU noise and the arm's
+            # own motion were added, so nearly half the trials posed no
+            # conflict. Re-aiming each step at where the arm goes if it does
+            # NOT replan makes the baseline a collision by construction: doing
+            # nothing gets hit, and only deviating from that path escapes,
+            # which is the thing under test.
+            #
+            # The obstacle is chasing a recorded path, not the live arm. It
+            # cannot react to a replan, so a robot that moves early genuinely
+            # gets away -- it is not being cheated by an omniscient pursuer.
+            if not closing:
+                closing = True
+                proc.sigma = sigma * PURSUIT_NOISE
+                # Make the velocity actually follow the command while closing.
+                # At theta 1.4 the velocity time constant is 0.71 s, comparable
+                # to the dart itself, so the obstacle spent the whole approach
+                # accelerating and arrived late and wide. A shorter constant
+                # lets it reach the closing speed it was told to hold; the
+                # noise is unchanged, so the path is no straighter.
+                proc.theta = PURSUIT_THETA
+            here = tcp_path[min(int(t / dt), len(tcp_path) - 1)]
+            proc.mu = (here - proc.pos) / max(t_hit - t, 3.0 * dt)
+        elif closing and t > t_hit:
+            proc.mu = np.zeros(3)          # past it; let it drift away
+        pos[s] = proc.step(dt)
+    obs = pos + rng.normal(0.0, meas_std, pos.shape)
+    return Track(positions=pos, observations=obs, dt=dt, radius=radius,
+                 theta=theta, sigma=sigma)
+
+
+def record_intercept_tracks(n: int, **kw) -> list[Track]:
+    rng = np.random.default_rng()
+    return [record_intercept_track(rng=rng, **kw) for _ in range(n)]

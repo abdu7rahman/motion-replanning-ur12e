@@ -47,7 +47,8 @@ import mujoco
 import numpy as np
 
 from predictive_replanning.cell import PICK_TABLE, PLACE_XY, build_mjcf, CUBE_XY
-from predictive_replanning.obstacle import Track, load_tracks, record_tracks, save_tracks
+from predictive_replanning.obstacle import (Track, load_tracks, record_intercept_tracks,
+                                            record_tracks, save_tracks)
 from predictive_replanning.predict import ObstacleTracker, arm_points, time_to_collision
 from predictive_replanning.replan import deform_minimal, deform_optimise, soft_mask
 from predictive_replanning.task import pick_and_place, placed, solve
@@ -133,6 +134,25 @@ def carry_centre() -> tuple[np.ndarray, float, int]:
     end = fk_tcp_pos(traj[(names.index("transfer") + 1) * 14 - 1])
     mid = 0.5 * (start + end) + np.array([0.0, 0.0, BASE_Z])
     return mid, float(times[-1]), len(traj)
+
+
+def executed_tcp_path(dt: float = 0.02) -> tuple[np.ndarray, np.ndarray]:
+    """Where the tool actually goes, per simulation step, with nothing in the way.
+
+    Aiming an obstacle at a *commanded* waypoint misses, because the controller
+    lags the command: the interception landed 0.11 to 0.16 m wide on the trials
+    that stayed clear. This runs the baseline once with the obstacle parked out
+    of reach and records the tool where the simulator actually put it, indexed
+    by timestep, so an obstacle aimed at step s arrives where the arm is at step
+    s rather than where the plan said it would be.
+    """
+    parked = Track(positions=np.tile(np.array([2.0, 2.0, 2.0]), (4000, 1)),
+                   observations=np.tile(np.array([2.0, 2.0, 2.0]), (4000, 1)),
+                   dt=dt, radius=0.07, theta=1.4, sigma=0.28)
+    trace: list = []
+    run_one("none", parked, dt=dt, trace=trace)
+    tcp = np.array([fk_tcp_pos(f["q"]) for f in trace]) + np.array([0.0, 0.0, BASE_Z])
+    return tcp, np.array([f["t"] for f in trace])
 
 
 def make_tracks(n: int, *, dt: float = 0.02, radius: float = 0.07,
