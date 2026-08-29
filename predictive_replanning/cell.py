@@ -223,6 +223,17 @@ def build_mjcf(*, obstacle_radius: float = 0.09, seed_cubes: bool = True,
     </body>
   </worldbody>
 
+  <!-- Grasp as an equality constraint rather than friction. The ME5250 report
+       records the alternative: "the cube seems to not be physically attached in
+       simulation, occasionally resulting in dropped objects during transport".
+       Tuning contact friction until a box stays in the jaws would make every
+       success rate below a statement about that tuning. A weld says plainly
+       that a successful grasp is assumed and the thing being measured is
+       whether the arm gets the object there. -->
+  <equality>
+    <weld name="grasp_0" body1="hande" body2="cube_0" active="false" solref="0.01 1"/>
+  </equality>
+
   <actuator>
 {chr(10).join(f'    <position name="act_{j}" joint="{j}" kp="3000" dampratio="1"/>' for j in JOINTS)}
     <position name="act_grip_l" joint="hande_left_finger_joint" kp="200" dampratio="1"/>

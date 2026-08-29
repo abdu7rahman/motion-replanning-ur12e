@@ -47,7 +47,8 @@ def nominal_trajectory(q0, qg, n: int = 60, duration: float = 6.0):
     return q0[None, :] + s[:, None] * (qg - q0)[None, :], u * duration
 
 
-def _window(n: int, idx: int, width: int, lock_before: int = -1) -> np.ndarray:
+def _window(n: int, idx: int, width: int, lock_before: int = -1,
+            allow: np.ndarray | None = None) -> np.ndarray:
     """Raised cosine centred on idx, pinned to zero at both trajectory ends.
 
     `lock_before` freezes everything up to and including that index. The arm
@@ -60,14 +61,43 @@ def _window(n: int, idx: int, width: int, lock_before: int = -1) -> np.ndarray:
                  0.5 * (1.0 + np.cos(np.pi * (i - idx) / max(width, 1))), 0.0)
     if lock_before >= 0:
         w[:lock_before + 1] = 0.0
+    if allow is not None:
+        # Waypoints the task will not give up. The descent onto the cube, the
+        # grasp, the place and the release are precision moves against a known
+        # table; letting an avoidance push perturb them trades the job for the
+        # dodge. Gating only *when* a replan fires is not enough -- the window
+        # is eight waypoints wide and reaches into the next phase, which is how
+        # a reactive run ended up placing the cube 0 times out of 25.
+        w = w * np.asarray(allow, dtype=float)
     w[0] = 0.0
     w[-1] = 0.0
     return w
 
 
+def soft_mask(deformable: np.ndarray, width: int = 8) -> np.ndarray:
+    """Ramp the deformable mask to zero before every locked stretch.
+
+    A hard 0/1 mask leaves a step at the boundary: the last free waypoint can
+    move while the first locked one cannot, so the locked phase starts from
+    somewhere the plan did not put it. Here that shifted the grasp pose, the
+    cube was picked up with a different offset in the jaws, and it landed 7-8 cm
+    from target against a 6 cm tolerance -- placed, and scored a failure, with
+    nothing in the trajectory looking wrong. Ramping over the same width the
+    deformation window uses removes the step.
+    """
+    d = np.asarray(deformable, dtype=bool)
+    n = len(d)
+    locked = np.where(~d)[0]
+    if locked.size == 0:
+        return np.ones(n)
+    idx = np.arange(n)
+    dist = np.min(np.abs(idx[:, None] - locked[None, :]), axis=1).astype(float)
+    return np.clip(dist / max(width, 1), 0.0, 1.0) * d
+
+
 def deform_minimal(traj, times, t_now, tracker, *, base_radius, n_sigma,
                    clearance, horizon, sigma_cap, margin=0.03, iters=14,
-                   width=8, damping=0.08, lock_before=-1):
+                   width=8, damping=0.08, lock_before=-1, allow=None):
     """Push the path out of the predicted tube by as little as possible.
 
     Returns (traj, deviation, iterations, cleared).
@@ -86,7 +116,7 @@ def deform_minimal(traj, times, t_now, tracker, *, base_radius, n_sigma,
         pts, links = arm_points(traj[idx])
         d = np.linalg.norm(pts - centre, axis=1)
         j = int(np.argmin(d))
-        if idx <= lock_before:
+        if idx <= lock_before or (allow is not None and allow[idx] <= 1e-6):
             # The violation is in already-executed path. Nothing to deform.
             return traj, float(np.abs(traj - before).sum()), it, False
         away = (pts[j] - centre)
@@ -97,7 +127,7 @@ def deform_minimal(traj, times, t_now, tracker, *, base_radius, n_sigma,
         push = away * (depth + margin)
         J = point_jacobian(traj[idx], pts[j], int(links[j]))
         dq = J.T @ np.linalg.solve(J @ J.T + (damping ** 2) * np.eye(3), push)
-        traj = traj + _window(len(traj), idx, width, lock_before)[:, None] * dq[None, :]
+        traj = traj + _window(len(traj), idx, width, lock_before, allow)[:, None] * dq[None, :]
     ttc, _, _ = time_to_collision(
         traj, times, t_now, tracker, base_radius=base_radius, n_sigma=n_sigma,
         clearance=clearance, horizon=horizon, sigma_cap=sigma_cap)

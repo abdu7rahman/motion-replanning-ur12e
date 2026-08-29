@@ -159,3 +159,68 @@ def point_jacobian(q, point, link: int) -> np.ndarray:
         T = frames[i]
         J[:, i] = np.cross(T[:3, 2], p - T[:3, 3])
     return J
+
+
+# ── the tool chain, wrist_3 -> TCP ────────────────────────────────────
+# wrist_3 -> flange and flange -> tool0 are both fixed joints in
+# ur_macro.xacro; the two Hand-E offsets are xacro argument defaults in
+# robotiq_hande_description. Composed once at import.
+_FLANGE_RPY = (0.0, -np.pi / 2.0, -np.pi / 2.0)
+_TOOL0_RPY = (np.pi / 2.0, 0.0, np.pi / 2.0)
+#: coupler_height 0.011 + hande_height 0.099 + the end offset 0.0465.
+TCP_OFFSET_Z = 0.011 + 0.099 + 0.0465
+
+
+def _tool_transform() -> np.ndarray:
+    T = np.eye(4)
+    T[:3, :3] = rpy(*_FLANGE_RPY) @ rpy(*_TOOL0_RPY)
+    T = T @ np.array([[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, TCP_OFFSET_Z], [0, 0, 0, 1.0]])
+    return T
+
+
+_TOOL = _tool_transform()
+
+
+def fk_tcp(q) -> np.ndarray:
+    """Pose of the Hand-E's tool centre point, in base_link.
+
+    Solving IK against wrist_3 instead of this puts the gripper 0.157 m below
+    where it was asked to go, which is exactly far enough to drive the fingers
+    through a 0.30 m table.
+    """
+    return fk(q) @ _TOOL
+
+
+def fk_tcp_pos(q) -> np.ndarray:
+    return fk_tcp(q)[:3, 3]
+
+
+def tcp_jacobian(q) -> np.ndarray:
+    """Translational Jacobian of the TCP: the wrist Jacobian carried out to the
+    tool point, so the moment arm of the gripper is accounted for."""
+    frames = link_frames(q)
+    p_e = fk_tcp_pos(q)
+    J = np.zeros((3, 6))
+    for i, T in enumerate(frames):
+        J[:, i] = np.cross(T[:3, 2], p_e - T[:3, 3])
+    return J
+
+
+def ik_tcp(target_pos, q_seed, *, iters: int = 300, tol: float = 1e-4,
+           damping: float = 0.05):
+    """Damped least squares onto a TCP position, seeded at `q_seed`."""
+    q = np.array(q_seed, dtype=float)
+    target = np.asarray(target_pos, dtype=float)
+    err = np.inf
+    for _ in range(iters):
+        e = target - fk_tcp_pos(q)
+        err = float(np.linalg.norm(e))
+        if err < tol:
+            return q, True, err
+        J = tcp_jacobian(q)
+        dq = J.T @ np.linalg.solve(J @ J.T + (damping ** 2) * np.eye(3), e)
+        step = float(np.linalg.norm(dq))
+        if step > 0.25:
+            dq *= 0.25 / step
+        q = q + dq
+    return q, err < tol, err

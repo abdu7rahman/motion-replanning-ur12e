@@ -42,13 +42,20 @@ class ObstacleProcess:
 
     centre: np.ndarray = field(default_factory=lambda: np.array([-0.70, 0.10, 0.55]))
     box_half: np.ndarray = field(default_factory=lambda: np.array([0.26, 0.40, 0.22]))
-    theta: float = 1.4              # 1/s, how fast velocity reverts to mu
-    # Chosen so the stationary speed matches a hand moving in a shared cell,
-    # not so the results come out well. For OU the per-axis velocity std is
-    # sigma / sqrt(2 theta); at theta 1.4 and sigma 0.28 that is 0.167 m/s,
-    # i.e. an RMS 3-D speed of 0.29 m/s. Reported human reach speeds in
-    # collaborative workcells sit in the 0.2-0.5 m/s band.
-    sigma: float = 0.28             # m/s^(3/2), velocity noise
+    # For OU the per-axis velocity std is sigma / sqrt(2 theta), and theta sets
+    # how fast direction is forgotten. Both are turned up here on purpose: at
+    # theta 3.0 and sigma 0.9 the per-axis std is 0.367 m/s, an RMS 3-D speed of
+    # 0.64 m/s, and the velocity autocorrelation time is 1/theta = 0.33 s.
+    #
+    # That is deliberately harder than a person reaching into a cell, which the
+    # earlier setting (theta 1.4, sigma 0.28, 0.29 m/s) matched against the
+    # 0.2-0.5 m/s band reported for collaborative workcells. The point of the
+    # faster process is that direction is forgotten inside a third of a second,
+    # so a constant-velocity forecast has almost nothing to hold on to and the
+    # predictor is being asked to do something genuinely hard. Both numbers are
+    # constructor arguments; pass the old pair to get the gentler obstacle back.
+    theta: float = 3.0              # 1/s, how fast velocity reverts to mu
+    sigma: float = 0.9              # m/s^(3/2), velocity noise
     mu: np.ndarray = field(default_factory=lambda: np.zeros(3))
     radius: float = 0.09
     seed: int = 0
