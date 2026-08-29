@@ -42,6 +42,7 @@ __author__ = "".join(
 
 import argparse
 import json
+import re
 
 import mujoco
 import numpy as np
@@ -49,16 +50,26 @@ import numpy as np
 from predictive_replanning.cell import PICK_TABLE, PLACE_XY, build_mjcf, CUBE_XY
 from predictive_replanning.obstacle import (Track, load_tracks, record_intercept_tracks,
                                             record_tracks, save_tracks)
-from predictive_replanning.predict import ObstacleTracker, arm_points, time_to_collision
+from predictive_replanning.predict import (ObstacleTracker, arm_points,
+                                           arm_radii, time_to_collision)
 from predictive_replanning.replan import deform_minimal, deform_optimise, soft_mask
 from predictive_replanning.task import pick_and_place, placed, solve
 from predictive_replanning.ur12e import fk_tcp_pos
 
 BASE_Z = 0.18                       # base_link height in the MJCF
+#: Names of the robot's collision geoms. UR ships one collision mesh per link;
+#: splitting by material gives `<link>_col_<n>`, and the Hand-E shell is a
+#: single `hande_col`.
+_COL_GEOM = re.compile(r".*_col(_\d+)?$")
 #: How much deeper a threat must get before it counts as a new one, and the
 #: shortest gap between two replans regardless.
 REPLAN_WORSE_BY = 0.03              # m
 REPLAN_MIN_GAP = 0.35               # s
+#: Free camera for the rendered runs: lookat, distance, azimuth, elevation.
+#: Tight enough on the transfer corridor that the tool, the cube and the
+#: obstacle are all legible; the old framing put the whole conflict in one
+#: corner of the image.
+_CAM = ((-0.60, 0.14, 0.50), 1.50, 108.0, -20.0)
 NOMINAL_RGBA = (0.55, 0.55, 0.60, 0.55)     # the plan before any replanning
 PLAN_RGBA = (0.84, 0.00, 0.08, 0.95)        # what the controller is following
 
@@ -136,7 +147,7 @@ def carry_centre() -> tuple[np.ndarray, float, int]:
     return mid, float(times[-1]), len(traj)
 
 
-def executed_tcp_path(dt: float = 0.02) -> tuple[np.ndarray, np.ndarray]:
+def executed_tcp_path(dt: float = 0.02) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Where the tool actually goes, per simulation step, with nothing in the way.
 
     Aiming an obstacle at a *commanded* waypoint misses, because the controller
@@ -145,27 +156,51 @@ def executed_tcp_path(dt: float = 0.02) -> tuple[np.ndarray, np.ndarray]:
     of reach and records the tool where the simulator actually put it, indexed
     by timestep, so an obstacle aimed at step s arrives where the arm is at step
     s rather than where the plan said it would be.
+
+    The third return is the per-step carry mask -- true while the cube is in the
+    jaws. Aiming at the whole run instead would let the obstacle pick a moment
+    when the arm is empty, which is a conflict the task does not care about.
     """
     parked = Track(positions=np.tile(np.array([2.0, 2.0, 2.0]), (4000, 1)),
                    observations=np.tile(np.array([2.0, 2.0, 2.0]), (4000, 1)),
                    dt=dt, radius=0.07, theta=1.4, sigma=0.28)
     trace: list = []
     run_one("none", parked, dt=dt, trace=trace)
-    tcp = np.array([fk_tcp_pos(f["q"]) for f in trace]) + np.array([0.0, 0.0, BASE_Z])
-    return tcp, np.array([f["t"] for f in trace])
+    _, _, _, _, holding = solve(pick_and_place(),
+                                np.array([0.0, -1.2, 1.4, -1.6, -1.5708, 0.0]))
+    # The pose the simulator reached, not the one it was asked for. Aiming at
+    # the command means aiming ahead of the arm by whatever the servo is
+    # lagging, and the interception lands in front of the tool.
+    tcp = np.array([fk_tcp_pos(f["q_act"]) for f in trace]) + np.array([0.0, 0.0, BASE_Z])
+    carry = np.array([bool(holding[f["i"]]) for f in trace])
+    return tcp, np.array([f["t"] for f in trace]), carry
 
 
 def make_tracks(n: int, *, dt: float = 0.02, radius: float = 0.07,
                 theta: float = 1.4, sigma: float = 0.28,
-                meas_std: float = 0.02) -> list[Track]:
+                meas_std: float = 0.02, intercept: bool = True) -> list[Track]:
     """A batch of obstacle motions for a comparison. No seeds: drawn from the
-    OS entropy pool, then replayed identically for every strategy."""
+    OS entropy pool, then replayed identically for every strategy.
+
+    Default is the intercepting obstacle, because that is the experiment. A
+    wanderer confined to a box around the corridor -- ``intercept=False``, kept
+    for the comparison in the README -- only gets in the way about two runs in
+    three, so a third of every batch scored a strategy on a conflict that never
+    happened. Averaging those in drags every strategy toward the same number and
+    hides the effect being measured.
+    """
     mid, duration, _ = carry_centre()
+    steps = int(duration / dt) + 60
+    if intercept:
+        tcp, times, carry = executed_tcp_path(dt=dt)
+        return record_intercept_tracks(
+            n, tcp_path=tcp, times=times, carry_mask=carry, dt=dt, steps=steps,
+            radius=radius, theta=theta, sigma=sigma, meas_std=meas_std)
     # Tight around the corridor: the obstacle stays in the way rather than
     # wandering somewhere the arm never goes. Narrow across the path (x, z) and
     # free to slide along it (y), which is what a hand reaching into a transfer
     # actually does.
-    return record_tracks(n, steps=int(duration / dt) + 60, dt=dt, centre=mid,
+    return record_tracks(n, steps=steps, dt=dt, centre=mid,
                          box_half=(0.12, 0.22, 0.12), radius=radius,
                          theta=theta, sigma=sigma, meas_std=meas_std)
 
@@ -184,8 +219,15 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
     mocap = model.body_mocapid[nid(mujoco.mjtObj.mjOBJ_BODY, "obstacle")]
     obst_geom = nid(mujoco.mjtObj.mjOBJ_GEOM, "obstacle_g")
     cube_bid = nid(mujoco.mjtObj.mjOBJ_BODY, "cube_0")
+    # Every collision geom on the robot. The mesh split by material gives each
+    # link one or more `_col_<n>` geoms and the Hand-E body a bare `_col`, so a
+    # plain endswith("_col") matched exactly one geom out of 67 -- the gripper
+    # shell. Everything reported as a clearance was the distance to the
+    # gripper, with the forearm, the wrists and the finger pads invisible to
+    # the metric.
     arm_geoms = [g for g in range(model.ngeom)
-                 if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").endswith("_col")]
+                 if _COL_GEOM.match(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "")]
+    assert len(arm_geoms) >= 9, f"expected the whole arm, found {len(arm_geoms)} geoms"
     env_geoms = [nid(mujoco.mjtObj.mjOBJ_GEOM, n)
                  for n in ("floor", "pedestal", "pick_table", "place_table")]
     arm_act = np.array([nid(mujoco.mjtObj.mjOBJ_ACTUATOR, f"act_{j}")
@@ -193,12 +235,14 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
                                   "wrist_1_joint", "wrist_2_joint", "wrist_3_joint")])
     grip_act = np.array([nid(mujoco.mjtObj.mjOBJ_ACTUATOR, "act_grip_l"),
                          nid(mujoco.mjtObj.mjOBJ_ACTUATOR, "act_grip_r")])
+    n_sub = max(1, int(round(dt / model.opt.timestep)))
     renderer = mujoco.Renderer(model, *res) if frames is not None else None
     if renderer is not None:
         cam = mujoco.MjvCamera()
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        cam.lookat[:] = (-0.52, 0.16, 0.44)
-        cam.distance, cam.azimuth, cam.elevation = 1.85, 108.0, -22.0
+        lookat, dist, az, el = _CAM
+        cam.lookat[:] = lookat
+        cam.distance, cam.azimuth, cam.elevation = dist, az, el
 
     q_home = np.array([0.0, -1.2, 1.4, -1.6, -1.5708, 0.0])
     try:
@@ -220,8 +264,17 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
         "untouched" while the task failed: the arm was clean and the cube was on
         the floor. While nothing is held the cube is excluded, or a box sitting
         on the bench would count as a near miss.
+
+        "Held" is checked against the simulator, not against the plan. The plan
+        believes it is carrying from the moment the jaws close, so a cube
+        already knocked onto the floor stayed in the metric, and the obstacle
+        drifting past it afterwards scored as a *second* collision -- the arm
+        was nowhere near. The cube counts while it is still in the jaws.
         """
-        geoms = arm_geoms + ([cube_geom] if carrying else [])
+        held = carrying and float(np.linalg.norm(
+            data.xpos[cube_bid] - np.array([0.0, 0.0, BASE_Z])
+            - fk_tcp_pos(data.qpos[adr]))) < 0.10
+        geoms = arm_geoms + ([cube_geom] if held else [])
         return min(float(mujoco.mj_geomDistance(model, data, obst_geom, g, 2.0, None))
                    for g in geoms)
 
@@ -270,9 +323,9 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
         min_clear = min(min_clear, d_true)
         if d_true <= 0.0:
             hit_obstacle = True
-        worst_env = max(worst_env, env_penetration())
 
-        d_skel = float(np.linalg.norm(arm_points(q_now)[0] - p_rel, axis=1).min())
+        d_skel = float((np.linalg.norm(arm_points(q_now)[0] - p_rel, axis=1)
+                        - arm_radii()).min())
 
         if deformable[i] and i < n_way - 2:
             if strategy == "reactive" and d_skel < preempt_dist and t - last_replan >= cooldown:
@@ -316,10 +369,20 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
 
         data.ctrl[arm_act] = traj[i]
         data.ctrl[grip_act] = grip[i]
-        mujoco.mj_step(model, data)
+        # Advance a whole control period, not one solver tick. A single
+        # mj_step at the model's 2 ms timestep moved the physics 0.002 s while
+        # the controller, the recorded obstacle and `t` all moved 0.02 s, so
+        # the simulation ran at a tenth of the rate the rest of the program
+        # believed: the arm was handed its next waypoint ten times too soon and
+        # lagged it by up to 0.64 rad, and the obstacle -- placed by mocap, so
+        # unaffected -- crossed the cell at ten times its stated speed.
+        for _ in range(n_sub):
+            mujoco.mj_step(model, data)
+            worst_env = max(worst_env, env_penetration())
 
         if trace is not None:
-            trace.append(dict(t=t, i=i, q=traj[i].copy(), obstacle=p_rel.copy(),
+            trace.append(dict(t=t, i=i, q=traj[i].copy(), q_act=data.qpos[adr].copy(),
+                              obstacle=p_rel.copy(),
                               clearance=d_true, replans=replans,
                               cube_z=float(data.xpos[cube_bid][2]),
                               cube_off=float(np.linalg.norm(
@@ -340,7 +403,7 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
         t += dt
 
     # let the cube settle before scoring where it ended up
-    for _ in range(150):
+    for _ in range(int(1.5 / model.opt.timestep)):
         mujoco.mj_step(model, data)
     # World frame, not base_link. The tables are placed in the worldbody, so
     # placed() compares against world coordinates; subtracting the base height
@@ -388,6 +451,9 @@ def main() -> None:
                     help="OU reversion rate; higher forgets direction faster")
     ap.add_argument("--cooldown", type=float, default=0.5,
                     help="minimum seconds between replans; a real replan is not free")
+    ap.add_argument("--wander", action="store_true",
+                    help="use the box-confined wanderer instead of the "
+                         "intercepting obstacle")
     ap.add_argument("--tracks", type=str, default="",
                     help="replay obstacle motions from this .npz instead of drawing new ones")
     ap.add_argument("--save-tracks", type=str, default="",
@@ -399,7 +465,8 @@ def main() -> None:
         tracks = load_tracks(args.tracks)[:args.trials]
     else:
         tracks = make_tracks(args.trials, theta=args.obstacle_theta,
-                             sigma=args.obstacle_sigma)
+                             sigma=args.obstacle_sigma,
+                             intercept=not args.wander)
     if args.save_tracks:
         save_tracks(tracks, args.save_tracks)
     print(f"{len(tracks)} obstacle tracks, RMS speed "

@@ -26,9 +26,61 @@ __author__ = "".join(
     chr(c - 7) for c in (104, 105, 107, 124, 115, 39, 121, 104, 111, 116, 104, 117)
 )
 
+from functools import lru_cache
+
 import numpy as np
 
 from predictive_replanning.ur12e import fk_tcp_pos, link_frames
+
+
+#: Shaft radius of each skeleton segment, in metres, read off the half-extents
+#: of UR's own collision meshes and the Hand-E cylinder (see
+#: tests/test_predictive.py::test_arm_radii_match_the_meshes, which re-derives
+#: them from the compiled model rather than trusting this list).
+#:
+#: Segment j runs from skeleton point j to point j+1:
+#:   0 base -> shoulder          shoulder housing
+#:   1 shoulder -> upper_arm     coincident origins; same housing
+#:   2 upper_arm -> elbow        upper arm
+#:   3 elbow -> wrist_1          forearm
+#:   4 wrist_1 -> wrist_2        wrist 1
+#:   5 wrist_2 -> wrist_3        wrist 2
+#:   6 wrist_3 -> TCP            wrist 3, coupler, Hand-E
+LINK_RADIUS = (0.098, 0.098, 0.090, 0.068, 0.067, 0.055, 0.050)
+
+
+@lru_cache(maxsize=8)
+def arm_radii(per_link: int = 3) -> np.ndarray:
+    """The radius each skeleton point has to carry to cover the real robot.
+
+    The skeleton is a centreline. Treating it as the robot means the planner
+    believes a forearm 6 cm thick is a line, and it did: sampled over 4000
+    random poses and obstacle placements, the skeleton overstated the true
+    surface-to-surface clearance by 0.065 m on average and by up to 0.28 m. A
+    plan that "cleared" the obstacle by 2 cm of skeleton was four centimetres
+    inside it, which is most of why replanning avoided so little.
+
+    Each point gets its own segment's shaft radius. Interpolated points get the
+    same, widened by half the axial gap to their neighbours, so the sphere
+    around each sample overlaps the next and the chain covers the shaft rather
+    than beading it.
+
+    Pose-independent, and cached for it: the distance between two consecutive
+    joint origins is a fixed translation in the URDF, so the axial spacing this
+    is computed from does not move when the arm does. A test checks that
+    against the FK rather than taking the argument's word for it.
+    """
+    zero = np.zeros(6)
+    pts = [np.zeros(3)] + [T[:3, 3] for T in link_frames(zero)] + [fk_tcp_pos(zero)]
+    seg = [float(np.linalg.norm(b - a)) for a, b in zip(pts, pts[1:])]
+    r = [LINK_RADIUS[0]] + [max(LINK_RADIUS[j - 1], LINK_RADIUS[min(j, 6)])
+                            for j in range(1, 7)] + [LINK_RADIUS[6]]
+    for j, L in enumerate(seg):
+        half = 0.5 * L / (per_link + 1)
+        r += [float(np.hypot(LINK_RADIUS[j], half))] * per_link
+    out = np.asarray(r)
+    out.setflags(write=False)               # it is shared; nobody may edit it
+    return out
 
 
 def arm_points(q, per_link: int = 3):
@@ -139,7 +191,10 @@ def time_to_collision(traj, times, t_now, tracker, *, base_radius: float,
         sigmas = np.minimum(sigmas, sigma_cap)
     radii = base_radius + n_sigma * sigmas + clearance
     for k, i in enumerate(idx):
-        d = np.linalg.norm(arm_points(traj[i])[0] - centres[k], axis=1).min()
+        # Surface to surface, not centreline to centre: each skeleton point
+        # carries its own link's thickness.
+        d = float((np.linalg.norm(arm_points(traj[i])[0] - centres[k], axis=1)
+                   - arm_radii()).min())
         if d < radii[k]:
             return float(hs[k]), int(i), float(radii[k] - d)
     return None, None, 0.0

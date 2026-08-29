@@ -34,7 +34,8 @@ __author__ = "".join(
 
 import numpy as np
 
-from predictive_replanning.predict import arm_points, time_to_collision  # noqa: F401
+from predictive_replanning.predict import (arm_points, arm_radii,  # noqa: F401
+                                           time_to_collision)
 from predictive_replanning.ur12e import fk_tcp, point_jacobian_full
 
 
@@ -153,7 +154,7 @@ def deform_minimal(traj, times, t_now, tracker, *, base_radius, n_sigma,
         h = times[idx] - t_now
         centre = tracker.forecast([h])[0][0]
         pts, links = arm_points(traj[idx])
-        d = np.linalg.norm(pts - centre, axis=1)
+        d = np.linalg.norm(pts - centre, axis=1) - arm_radii()
         j = int(np.argmin(d))
         if idx <= lock_before or (allow is not None and allow[idx] <= 1e-6):
             # The violation is in already-executed path. Nothing to deform.
@@ -226,7 +227,7 @@ def deform_optimise(traj, times, t_now, tracker, *, base_radius, n_sigma,
         touched = 0
         for k, i in enumerate(idx):
             pts, links = arm_points(traj[i])
-            d = np.linalg.norm(pts - centres[k], axis=1)
+            d = np.linalg.norm(pts - centres[k], axis=1) - arm_radii()
             j = int(np.argmin(d))
             depth = radii[k] - d[j]
             if depth <= 0.0:
