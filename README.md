@@ -156,11 +156,11 @@ Paired on the same motions, by McNemar's exact test:
   The report said as much qualitatively; this is the denominator behind it.
 - **Predicting where it will be works.** Every predictive and optimising
   configuration beats the baseline on all three columns, none of them loses a
-  single paired trial on avoidance, and the smallest p-value in that block is
-  2 × 10⁻³.
+  single paired trial on avoidance, and the weakest p-value across those twelve
+  comparisons is 7 × 10⁻³.
 - **The best configuration is Strategy 3 with a one-second horizon**: 25/90
   successes against 0/90, p = 6 × 10⁻⁸, and it beats the single-point
-  deformation at the same horizon on success (+5/−17, p = 0.017).
+  deformation at the same horizon on success (+17/−5, p = 0.017).
 - **Horizon buys avoidance and spends the payload.** Predictive at 1.0 s is
   untouched 37 times to 15 at 0.5 s (+22/−0, p = 5 × 10⁻⁷) and places 17 times
   to 28. Its path is 1.49x nominal: it is dodging hard, and a hard dodge shakes
