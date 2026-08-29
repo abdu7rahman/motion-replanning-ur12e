@@ -22,7 +22,8 @@ from predictive_replanning import ur12e                              # noqa: E40
 from predictive_replanning.cell import build_mjcf                    # noqa: E402
 from predictive_replanning.obstacle import ObstacleProcess           # noqa: E402
 from predictive_replanning.predict import arm_points, ObstacleTracker  # noqa: E402
-from predictive_replanning.replan import (_window, deform_minimal,    # noqa: E402
+from predictive_replanning.replan import (_limit_payload, _window,   # noqa: E402
+                                          deform_minimal, deform_optimise,
                                           nominal_trajectory, soft_mask)
 from predictive_replanning.task import (grip_grasp, grip_open,       # noqa: E402
                                         pick_and_place, placed, solve)
@@ -251,6 +252,73 @@ def test_fingers_can_actually_collide():
           f"neq={model.neq}")
 
 
+def test_tool_stays_vertical():
+    """The tool must be straight down everywhere, not only at phase ends.
+
+    Interpolating joint angles between two solved poses pinned the tool at the
+    endpoints and let it swing 9.8 degrees off vertical in between, so the
+    "top-down" grasp was top-down twice per phase. The trajectory is solved in
+    task space for this reason.
+    """
+    traj, _, _, _, _ = solve(pick_and_place(), np.array([0.0, -1.2, 1.4, -1.6, -1.57, 0.0]))
+    tilts = [np.degrees(np.arccos(np.clip(-ur12e.fk_tcp(q)[:3, 2][2], -1, 1))) for q in traj]
+    check("tool vertical at every waypoint", max(tilts) < 1.0,
+          f"max {max(tilts):.4f} deg, mean {np.mean(tilts):.4f} deg")
+
+
+def test_deformation_does_not_tip_the_tool():
+    """A dodge must not tilt the gripper; that is how a friction grasp drops."""
+    traj, times, _, deform, holding = solve(
+        pick_and_place(), np.array([0.0, -1.2, 1.4, -1.6, -1.57, 0.0]))
+    allow = soft_mask(deform)
+    mid = int(np.median(np.where(deform)[0]))
+    on = arm_points(traj[mid])[0][6]
+
+    def tilt(tr):
+        return max(np.degrees(np.arccos(np.clip(-ur12e.fk_tcp(q)[:3, 2][2], -1, 1))) for q in tr)
+
+    for name, fn in (("minimal", deform_minimal), ("optimise", deform_optimise)):
+        trk = ObstacleTracker(on)
+        for _ in range(30):
+            trk.update(on, 0.02)
+        new, dev, _, _ = fn(traj, times, 0.0, trk, base_radius=0.09, n_sigma=1.0,
+                            clearance=0.02, horizon=1.0, sigma_cap=0.1,
+                            allow=allow, carrying=holding)
+        check(f"{name}: tool still vertical after deforming", tilt(new) < 1.0,
+              f"max {tilt(new):.3f} deg")
+        check(f"{name}: it actually moved something", dev > 0.0, f"{dev:.3f} rad")
+
+
+def test_payload_bound_is_relative():
+    """The bound limits the speed-up over the plan, not absolute speed.
+
+    An absolute cap throttled every deformation: the nominal carry already
+    moves the tool 0.11 m between waypoints, so a few-centimetre ceiling scaled
+    every correction to a third of itself and nothing ever cleared.
+    """
+    traj, _, _, _, holding = solve(pick_and_place(),
+                                   np.array([0.0, -1.2, 1.4, -1.6, -1.57, 0.0]))
+    zero = np.zeros_like(traj)
+    check("a zero deformation is never scaled",
+          np.allclose(_limit_payload(traj, traj, zero, holding), 0.0))
+    # A *uniform* offset shifts every waypoint alike, so the tool's speed
+    # between waypoints is unchanged and the bound correctly leaves it alone --
+    # the bound is on speed-up, not on displacement. To trip it the
+    # perturbation has to vary along the trajectory, so this one alternates.
+    flat = np.zeros_like(traj)
+    flat[holding] += 0.35
+    check("a uniform offset is not a speed-up, so it passes",
+          np.allclose(_limit_payload(traj, traj, flat, holding), flat))
+
+    big = np.zeros_like(traj)
+    sign = np.where(np.arange(len(traj)) % 2 == 0, 1.0, -1.0)
+    big[holding] += 0.35 * sign[holding, None]
+    out = _limit_payload(traj, traj, big, holding)
+    check("a deformation that outruns the plan is scaled back",
+          float(np.abs(out).max()) < float(np.abs(big).max()),
+          f"{np.abs(big).max():.3f} -> {np.abs(out).max():.3f} rad")
+
+
 def test_placed_criterion():
     """Success is the cube on the place table, not merely somewhere."""
     from predictive_replanning.cell import CUBE_HALF, PLACE_TABLE, PLACE_XY
@@ -267,7 +335,9 @@ def main():
                test_tcp_frame, test_point_jacobian, test_ou_closed_form,
                test_deformation_contract, test_deformation_cannot_trade_the_task,
                test_task_reaches_every_phase, test_gripper_is_derived_not_typed,
-               test_fingers_can_actually_collide, test_placed_criterion,
+               test_fingers_can_actually_collide, test_tool_stays_vertical,
+               test_deformation_does_not_tip_the_tool, test_payload_bound_is_relative,
+               test_placed_criterion,
                test_tracker_is_not_told_the_truth):
         print(f"\n{fn.__name__}")
         fn()

@@ -56,7 +56,15 @@ SOURCES = {
 HANDE = dict(coupler_height=0.011, coupler_shell_height=0.0169,
              coupler_parent_cutoff=0.003, coupler_hande_cutoff=0.0029,
              hande_height=0.099, hande_radius=0.0375,
-             finger_mass=0.03804, grip_min=0.0, grip_max=0.025)
+             finger_mass=0.03804, grip_min=0.0, grip_max=0.025,
+             # Robotiq's rated grip force for the Hand-E, and the squeeze the
+             # task commands. The actuator gain is derived from the pair rather
+             # than picked: kp = force / squeeze. Left at a round kp the model
+             # produced 2.2 N, an order of magnitude under the rated minimum,
+             # which held the cube only while the arm barely moved and threw it
+             # across the cell once the arm actually articulated.
+             grip_force_min_n=20.0, grip_force_max_n=185.0,
+             grip_force_nominal_n=20.0, grip_squeeze_m=0.0025)
 
 
 class _DegreesLoader(yaml.SafeLoader):

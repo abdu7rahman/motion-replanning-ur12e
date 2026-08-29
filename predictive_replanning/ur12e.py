@@ -224,3 +224,101 @@ def ik_tcp(target_pos, q_seed, *, iters: int = 300, tol: float = 1e-4,
             dq *= 0.25 / step
         q = q + dq
     return q, err < tol, err
+
+
+def tcp_jacobian_full(q) -> np.ndarray:
+    """6x6 Jacobian at the TCP: linear rows then angular rows."""
+    frames = link_frames(q)
+    p_e = fk_tcp_pos(q)
+    J = np.zeros((6, 6))
+    for i, T in enumerate(frames):
+        z = T[:3, 2]
+        J[:3, i] = np.cross(z, p_e - T[:3, 3])
+        J[3:, i] = z
+    return J
+
+
+def _log_so3(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> axis-angle vector, the orientation error term."""
+    c = (np.trace(R) - 1.0) / 2.0
+    c = float(np.clip(c, -1.0, 1.0))
+    ang = np.arccos(c)
+    if ang < 1e-9:
+        return np.zeros(3)
+    if abs(np.pi - ang) < 1e-6:
+        # near pi the skew part vanishes; take the axis from R + I instead
+        w = np.sqrt(np.maximum((np.diag(R) + 1.0) / 2.0, 0.0))
+        k = int(np.argmax(w))
+        axis = (R[:, k] + np.eye(3)[:, k]) / (2.0 * w[k])
+        return ang * axis / np.linalg.norm(axis)
+    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    return ang * v / (2.0 * np.sin(ang))
+
+
+def ik_pose(target_pos, target_R, q_seed, *, iters: int = 400, pos_tol: float = 5e-4,
+            rot_tol: float = 0.01, damping: float = 0.06, rot_weight: float = 0.6):
+    """Full 6-DOF damped least squares onto a TCP pose.
+
+    Position-only IK was a real modelling error rather than a simplification.
+    Minimum-norm steps move whichever joints shift the tool most cheaply, so the
+    shoulder did nearly all the work, the elbow swung 0.27 rad against the
+    shoulder's 0.93, and wrist_3 never moved at all -- it cannot change a
+    position, so a position-only task gives it nothing to do. The visible result
+    is an arm that slides around with a locked elbow instead of articulating.
+
+    Worse, nothing held the tool upright: the gripper arrived at the cube 36.6
+    degrees off vertical and drifted between 21 and 37 degrees across the task.
+    The jaws straddled the cube by luck. Commanding the orientation makes the
+    pick top-down, gives the wrist something to do, and makes the arm move the
+    way the hardware would.
+
+    `rot_weight` trades the two errors; orientation is in radians and position
+    in metres, so they are not comparable without it.
+    """
+    q = np.array(q_seed, dtype=float)
+    target_pos = np.asarray(target_pos, dtype=float)
+    target_R = np.asarray(target_R, dtype=float)
+    pe = re = np.inf
+    for _ in range(iters):
+        T = fk_tcp(q)
+        e_p = target_pos - T[:3, 3]
+        e_r = _log_so3(target_R @ T[:3, :3].T)
+        pe, re = float(np.linalg.norm(e_p)), float(np.linalg.norm(e_r))
+        if pe < pos_tol and re < rot_tol:
+            return q, True, pe, re
+        e = np.concatenate([e_p, rot_weight * e_r])
+        J = tcp_jacobian_full(q)
+        J = np.vstack([J[:3], rot_weight * J[3:]])
+        dq = J.T @ np.linalg.solve(J @ J.T + (damping ** 2) * np.eye(6), e)
+        step = float(np.linalg.norm(dq))
+        if step > 0.2:
+            dq *= 0.2 / step
+        q = q + dq
+    return q, (pe < pos_tol and re < rot_tol), pe, re
+
+
+#: Tool pose for a top-down grasp: tool z straight down, jaw axis along world X.
+#: The Hand-E's fingers slide on the tool x axis, so this is what decides which
+#: way the jaws close across the object.
+TOP_DOWN = np.array([[1.0, 0.0, 0.0],
+                     [0.0, -1.0, 0.0],
+                     [0.0, 0.0, -1.0]])
+
+
+def point_jacobian_full(q, point, link: int) -> np.ndarray:
+    """6xN for a point on `link`: its translation rows, and the TCP's rotation rows.
+
+    The rotation rows are what let a caller push the point while commanding the
+    tool to hold its orientation. A purely translational push is free to tilt
+    the wrist, and tilting a gripper mid-carry is how a friction grasp loses
+    the object it is holding.
+    """
+    frames = link_frames(q)
+    p = np.asarray(point, dtype=float)
+    J = np.zeros((6, 6))
+    for i in range(6):
+        z = frames[i][:3, 2]
+        if i < min(link, 6):
+            J[:3, i] = np.cross(z, p - frames[i][:3, 3])
+        J[3:, i] = z
+    return J

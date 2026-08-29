@@ -47,6 +47,9 @@ CUBE_HALF = 0.02                     # the 4 cm cubes the write-up grasps
 CUBE_XY = ((-0.66, -0.26), (-0.78, -0.14), (-0.70, -0.06))
 PLACE_XY = (-0.58, 0.50)
 
+#: kp such that the commanded squeeze produces the rated nominal grip force.
+_GRIP_KP = HANDE["grip_force_nominal_n"] / HANDE["grip_squeeze_m"]
+
 LINKS = ("shoulder", "upper_arm", "forearm", "wrist_1", "wrist_2", "wrist_3")
 JOINTS = ("shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
           "wrist_1_joint", "wrist_2_joint", "wrist_3_joint")
@@ -98,15 +101,23 @@ def _finger_collision(prefix: str, prov: dict, indent: str) -> str:
     These were missing entirely: every finger geom was visual-only, so the jaws
     passed through the cube and a grasp was impossible. finger_collision.dae
     ships in the description package and was already being converted and then
-    not used. High friction and a soft contact pair, because a parallel jaw
-    holding a box is a friction grasp and MuJoCo's defaults are too slippery to
-    hold one against the accelerations of a carry.
+    not used.
+
+    The contact is deliberately compliant. Hand-E fingertips are rubber-faced,
+    and modelling them as rigid made the grasp bistable rather than merely
+    weak: sweeping the commanded grip force gave 10 N holding, 20 N dropping,
+    30 and 45 N holding, 60 and 90 N throwing the cube across the cell. A
+    non-monotonic response to force is a solver artefact, not a grip, and
+    tuning the force until a run passed would have been exactly the mistake the
+    ME5250 report warns about when it records the cube "not physically
+    attached in simulation". Softening the contact is a property the real
+    fingers have.
     """
     out = []
     for n, part in enumerate(prov["hande_finger_collision"]["parts"]):
         out.append(f'<geom name="{prefix}_{n}" type="mesh" mesh="{Path(part["mesh"]).stem}" '
                    f'group="3" rgba="0 0 0 0" friction="2.0 0.05 0.001" '
-                   f'solref="0.004 1" solimp="0.95 0.99 0.001" condim="4"/>')
+                   f'solref="0.02 1" solimp="0.90 0.95 0.002" condim="4"/>')
     return f"\n{indent}".join(out)
 
 
@@ -252,13 +263,14 @@ def build_mjcf(*, obstacle_radius: float = 0.09, with_cubes: bool = True,
 
   <actuator>
 {chr(10).join(f'    <position name="act_{j}" joint="{j}" kp="3000" dampratio="1"/>' for j in JOINTS)}
-    <!-- Force-limited, so commanding the jaws past the cube's face squeezes it
-         rather than driving through it. This is what makes the grasp a grasp:
-         the fingers close until they meet the object and then hold it. -->
-    <position name="act_grip_l" joint="hande_left_finger_joint" kp="900" dampratio="1"
-              forcerange="-130 130"/>
-    <position name="act_grip_r" joint="hande_right_finger_joint" kp="900" dampratio="1"
-              forcerange="-130 130"/>
+    <!-- Force-limited, so commanding the jaws past the object's face squeezes
+         it rather than driving through it. The gain is Robotiq's rated grip
+         force divided by the squeeze the task commands, and the limit is the
+         rated maximum, so the jaws hold with a force the real gripper has. -->
+    <position name="act_grip_l" joint="hande_left_finger_joint" kp="{_GRIP_KP:.0f}"
+              dampratio="1" forcerange="-{HANDE['grip_force_max_n']:.0f} {HANDE['grip_force_max_n']:.0f}"/>
+    <position name="act_grip_r" joint="hande_right_finger_joint" kp="{_GRIP_KP:.0f}"
+              dampratio="1" forcerange="-{HANDE['grip_force_max_n']:.0f} {HANDE['grip_force_max_n']:.0f}"/>
   </actuator>
 </mujoco>
 """

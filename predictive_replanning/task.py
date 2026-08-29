@@ -27,8 +27,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from predictive_replanning.assets import HANDE
 from predictive_replanning.cell import CUBE_HALF, CUBE_XY, PICK_TABLE, PLACE_TABLE, PLACE_XY
-from predictive_replanning.ur12e import ik_tcp
+from predictive_replanning.ur12e import TOP_DOWN, fk_tcp_pos, ik_pose
 
 # Hand-E finger travel is 0 .. 0.025 m per finger, and the jaw gap measured off
 # the vendor's own collision meshes is exactly twice it: travel 0 is CLOSED and
@@ -42,7 +43,7 @@ from predictive_replanning.ur12e import ik_tcp
 # actuator is what produces grip force instead of penetration.
 GRIP_SPAN_PER_TRAVEL = 2.0
 GRIP_CLEARANCE = 0.008          # m of gap either side when open
-GRIP_SQUEEZE = 0.0025           # m the command goes inside each face
+GRIP_SQUEEZE = HANDE["grip_squeeze_m"]   # m the command goes inside each face
 
 
 def grip_open(width: float) -> float:
@@ -97,22 +98,32 @@ def solve(phases: list[Phase], q_home, *, per_phase: int = 14):
     so the controller reads one index and gets every command for that instant.
     """
     q = np.array(q_home, dtype=float)
+    tcp = fk_tcp_pos(q)
     traj, times, grip, deform, holding = [], [], [], [], []
     t = 0.0
     for ph in phases:
-        q_goal, ok, err = ik_tcp(ph.tcp, q)
-        if not ok:
-            raise RuntimeError(f"IK failed for phase {ph.name}: residual {err:.4f} m")
         u = np.linspace(0.0, 1.0, per_phase)
         s = 10 * u ** 3 - 15 * u ** 4 + 6 * u ** 5      # quintic, zero end rates
         for k, sk in enumerate(s):
-            traj.append(q + sk * (q_goal - q))
+            # Interpolate the TOOL along a straight line and solve for the arm
+            # at every waypoint, rather than interpolating joint angles between
+            # two solved poses. Joint-space interpolation only pins the tool at
+            # the ends: in between it swung up to 9.8 degrees off vertical, so
+            # the "top-down" grasp was top-down twice per phase and tilted the
+            # rest of the time.
+            target = tcp + sk * (np.asarray(ph.tcp, float) - tcp)
+            q, ok, pe, re = ik_pose(target, TOP_DOWN, q)
+            if not ok:
+                raise RuntimeError(
+                    f"IK failed in phase {ph.name} at s={sk:.2f}: "
+                    f"{pe:.4f} m, {re:.4f} rad")
+            traj.append(q.copy())
             times.append(t + u[k] * ph.seconds)
             grip.append(ph.grip)
             deform.append(ph.deformable)
             holding.append(ph.holding)
         t += ph.seconds
-        q = q_goal
+        tcp = np.asarray(ph.tcp, float)
     return (np.asarray(traj), np.asarray(times), np.asarray(grip),
             np.asarray(deform, dtype=bool), np.asarray(holding, dtype=bool))
 

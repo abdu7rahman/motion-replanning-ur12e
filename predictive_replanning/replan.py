@@ -34,8 +34,22 @@ __author__ = "".join(
 
 import numpy as np
 
-from predictive_replanning.predict import arm_points, time_to_collision
-from predictive_replanning.ur12e import point_jacobian
+from predictive_replanning.predict import arm_points, time_to_collision  # noqa: F401
+from predictive_replanning.ur12e import fk_tcp, point_jacobian_full
+
+
+#: Weight on "do not rotate the tool" against "move this point". High enough
+#: that the orientation task wins, since the position task has three spare
+#: degrees of freedom to satisfy it in.
+ROT_HOLD = 3.0
+
+#: How much faster than the original plan the tool centre may move once
+#: something is in the jaws. Relative, not absolute: the nominal carry already
+#: moves the tool 0.11 m between waypoints, so an absolute cap of a few
+#: centimetres throttled every deformation to a third of itself and nothing
+#: ever cleared. What matters is not the speed, it is the *increase* the
+#: deformation asks the grasp to survive.
+MAX_TCP_SPEEDUP = 1.35
 
 
 def nominal_trajectory(q0, qg, n: int = 60, duration: float = 6.0):
@@ -95,9 +109,34 @@ def soft_mask(deformable: np.ndarray, width: int = 8) -> np.ndarray:
     return np.clip(dist / max(width, 1), 0.0, 1.0) * d
 
 
+def _limit_payload(baseline, traj, step, carrying) -> np.ndarray:
+    """Scale a deformation back until the tool stops outrunning the payload.
+
+    Over the waypoints where something is in the jaws, the deformed path may
+    not move the tool more than MAX_TCP_SPEEDUP times faster between samples
+    than the plan it started from. Without a bound the replanner buys clearance
+    with an acceleration the grasp cannot survive, which scores as a dodge and
+    reads as a dropped cube.
+    """
+    idx = np.where(carrying)[0]
+    if len(idx) < 2:
+        return step
+
+    def worst(tr):
+        tcp = np.array([fk_tcp(q)[:3, 3] for q in tr[idx]])
+        return float(np.max(np.linalg.norm(np.diff(tcp, axis=0), axis=1)))
+
+    allowed = MAX_TCP_SPEEDUP * worst(baseline)
+    got = worst(traj + step)
+    if got <= allowed or got <= 1e-9:
+        return step
+    return step * (allowed / got)
+
+
 def deform_minimal(traj, times, t_now, tracker, *, base_radius, n_sigma,
                    clearance, horizon, sigma_cap, margin=0.03, iters=14,
-                   width=8, damping=0.08, lock_before=-1, allow=None):
+                   width=8, damping=0.08, lock_before=-1, allow=None,
+                   carrying=None):
     """Push the path out of the predicted tube by as little as possible.
 
     Returns (traj, deviation, iterations, cleared).
@@ -125,10 +164,102 @@ def deform_minimal(traj, times, t_now, tracker, *, base_radius, n_sigma,
         # can actually produce rather than an arbitrary axis.
         away = away / nrm if nrm > 1e-9 else np.array([0.0, 0.0, 1.0])
         push = away * (depth + margin)
-        J = point_jacobian(traj[idx], pts[j], int(links[j]))
-        dq = J.T @ np.linalg.solve(J @ J.T + (damping ** 2) * np.eye(3), push)
-        traj = traj + _window(len(traj), idx, width, lock_before, allow)[:, None] * dq[None, :]
+        # Push the offending point AND hold the tool where it is. The angular
+        # rows command zero rotation, so the deformation moves the arm without
+        # tipping the gripper -- a translational-only push is free to tilt the
+        # wrist, and tilting a gripper mid-carry is how a friction grasp drops
+        # what it is holding.
+        J = point_jacobian_full(traj[idx], pts[j], int(links[j]))
+        e = np.concatenate([push, np.zeros(3)])
+        W = np.diag([1.0, 1.0, 1.0, ROT_HOLD, ROT_HOLD, ROT_HOLD])
+        Jw = W @ J
+        dq = Jw.T @ np.linalg.solve(Jw @ Jw.T + (damping ** 2) * np.eye(6), W @ e)
+        step = _window(len(traj), idx, width, lock_before, allow)[:, None] * dq[None, :]
+        if carrying is not None:
+            step = _limit_payload(before, traj, step, carrying)
+        traj = traj + step
     ttc, _, _ = time_to_collision(
         traj, times, t_now, tracker, base_radius=base_radius, n_sigma=n_sigma,
         clearance=clearance, horizon=horizon, sigma_cap=sigma_cap)
+    return traj, float(np.abs(traj - before).sum()), iters, ttc is None
+
+
+def deform_optimise(traj, times, t_now, tracker, *, base_radius, n_sigma,
+                    clearance, horizon, sigma_cap, margin=0.03, iters=8,
+                    step_size=0.55, smooth=2, lock_before=-1, allow=None,
+                    carrying=None, damping=0.08):
+    """Strategy 3: deform every threatened waypoint at once, then smooth.
+
+    The proposal called this "optimization-based local replanning ... local
+    trajectory deformation using gradient-based optimization (CHOMP/TrajOpt-
+    inspired)". Where `deform_minimal` finds the single worst violation and
+    pushes it through a fixed window, this evaluates the repulsion at *every*
+    waypoint inside the horizon and applies the whole field in one update,
+    smoothed along the trajectory.
+
+    The difference that matters for this task is not the clearance -- both
+    clear -- it is the shape. A windowed push puts all the correction in one
+    place and the arm has to accelerate through it; a smoothed field spreads
+    the same correction over the whole threatened stretch, which is gentler on
+    a friction grasp. Orientation is held and the payload bound applies, as in
+    deform_minimal.
+    """
+    traj = np.array(traj, dtype=float, copy=True)
+    before = traj.copy()
+    n = len(traj)
+    W = np.diag([1.0, 1.0, 1.0, ROT_HOLD, ROT_HOLD, ROT_HOLD])
+    gate = None if allow is None else np.asarray(allow, dtype=float)
+
+    for it in range(iters):
+        future = [(i, times[i] - t_now) for i in range(n)
+                  if 0.0 <= times[i] - t_now <= horizon and i > lock_before]
+        if not future:
+            break
+        idx = np.array([i for i, _ in future])
+        hs = np.array([h for _, h in future])
+        centres, sigmas = tracker.forecast(hs)
+        if sigma_cap is not None:
+            sigmas = np.minimum(sigmas, sigma_cap)
+        radii = base_radius + n_sigma * sigmas + clearance
+
+        grad = np.zeros_like(traj)
+        touched = 0
+        for k, i in enumerate(idx):
+            pts, links = arm_points(traj[i])
+            d = np.linalg.norm(pts - centres[k], axis=1)
+            j = int(np.argmin(d))
+            depth = radii[k] - d[j]
+            if depth <= 0.0:
+                continue
+            touched += 1
+            away = pts[j] - centres[k]
+            nrm = float(np.linalg.norm(away))
+            away = away / nrm if nrm > 1e-9 else np.array([0.0, 0.0, 1.0])
+            J = point_jacobian_full(traj[i], pts[j], int(links[j]))
+            e = np.concatenate([away * (depth + margin), np.zeros(3)])
+            Jw = W @ J
+            grad[i] = Jw.T @ np.linalg.solve(Jw @ Jw.T + (damping ** 2) * np.eye(6), W @ e)
+        if touched == 0:
+            return traj, float(np.abs(traj - before).sum()), it, True
+
+        # CHOMP's smoothness step, as a moving average: a correction that is
+        # smooth along the trajectory costs less acceleration than the same
+        # correction concentrated at one waypoint.
+        for _ in range(smooth):
+            grad = np.vstack([grad[:1], 0.25 * grad[:-2] + 0.5 * grad[1:-1] + 0.25 * grad[2:],
+                              grad[-1:]])
+        grad[:lock_before + 1] = 0.0
+        grad[0] = 0.0
+        grad[-1] = 0.0
+        if gate is not None:
+            grad = grad * gate[:, None]
+
+        step = step_size * grad
+        if carrying is not None:
+            step = _limit_payload(before, traj, step, carrying)
+        traj = traj + step
+
+    ttc, _, _ = time_to_collision(traj, times, t_now, tracker, base_radius=base_radius,
+                                  n_sigma=n_sigma, clearance=clearance, horizon=horizon,
+                                  sigma_cap=sigma_cap)
     return traj, float(np.abs(traj - before).sum()), iters, ttc is None

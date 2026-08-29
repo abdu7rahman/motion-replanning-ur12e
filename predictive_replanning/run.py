@@ -49,12 +49,37 @@ import numpy as np
 from predictive_replanning.cell import PICK_TABLE, PLACE_XY, build_mjcf, CUBE_XY
 from predictive_replanning.obstacle import Track, load_tracks, record_tracks, save_tracks
 from predictive_replanning.predict import ObstacleTracker, arm_points, time_to_collision
-from predictive_replanning.replan import deform_minimal, soft_mask
+from predictive_replanning.replan import deform_minimal, deform_optimise, soft_mask
 from predictive_replanning.task import pick_and_place, placed, solve
 from predictive_replanning.ur12e import fk_tcp_pos
 
 BASE_Z = 0.18                       # base_link height in the MJCF
-STRATEGIES = ("none", "reactive", "predictive")
+#: How much deeper a threat must get before it counts as a new one, and the
+#: shortest gap between two replans regardless.
+REPLAN_WORSE_BY = 0.03              # m
+REPLAN_MIN_GAP = 0.35               # s
+NOMINAL_RGBA = (0.55, 0.55, 0.60, 0.55)     # the plan before any replanning
+PLAN_RGBA = (0.84, 0.00, 0.08, 0.95)        # what the controller is following
+
+
+def _draw_path(scene, joints, rgba, *, every: int = 2, radius: float = 0.006):
+    """Append the TCP track of a joint trajectory to a rendered scene.
+
+    Uses the scene's spare geom slots directly. MuJoCo will not grow the buffer,
+    so the loop stops when it is full rather than overrunning it.
+    """
+    pts = np.asarray([fk_tcp_pos(q) for q in joints[::every]])
+    pts = pts + np.array([0.0, 0.0, BASE_Z])
+    for a, b in zip(pts, pts[1:]):
+        if scene.ngeom >= scene.maxgeom:
+            return
+        g = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_CAPSULE,
+                            np.zeros(3), np.zeros(3), np.zeros(9),
+                            np.asarray(rgba, dtype=np.float32))
+        mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_CAPSULE, radius, a, b)
+        scene.ngeom += 1
+STRATEGIES = ("none", "reactive", "predictive", "optimise")
 
 
 def _arm_qpos_adr(model):
@@ -194,6 +219,7 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
     mujoco.mj_forward(model, data)
 
     t, last_replan = 0.0, -1e9
+    engaged, last_depth = False, 0.0
     replans, deviation, min_clear = 0, 0.0, np.inf
     hit_obstacle = False
     worst_env = 0.0
@@ -217,29 +243,44 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
 
         d_skel = float(np.linalg.norm(arm_points(q_now)[0] - p_rel, axis=1).min())
 
-        if deformable[i] and t - last_replan >= cooldown and i < n_way - 2:
-            if strategy == "reactive" and d_skel < preempt_dist:
+        if deformable[i] and i < n_way - 2:
+            if strategy == "reactive" and d_skel < preempt_dist and t - last_replan >= cooldown:
                 traj, dev, _, _ = deform_minimal(
                     traj, times, t, ObstacleTracker(p_rel, meas_std=meas_std),
                     base_radius=base_radius, n_sigma=0.0, clearance=clearance,
                     horizon=duration, sigma_cap=0.0, lock_before=i,
-                    allow=allow)
+                    allow=allow, carrying=holding)
                 deviation += dev
                 replans += 1
                 last_replan = t
-            elif strategy == "predictive":
-                ttc, _, _ = time_to_collision(
+            elif strategy in ("predictive", "optimise"):
+                ttc, _, depth = time_to_collision(
                     traj, times, t, tracker, base_radius=base_radius,
                     n_sigma=n_sigma, clearance=clearance, horizon=ttc_threshold,
                     sigma_cap=sigma_cap)
-                if ttc is not None:
-                    traj, dev, _, _ = deform_minimal(
+                # Hysteresis on the threat, not on the clock. A fixed cooldown
+                # both over- and under-fires: it re-plans against a threat
+                # already handled, and refuses to re-plan when a new one arrives
+                # inside the window. Here a threat that is new fires straight
+                # away, and one that is merely getting worse has to clear a
+                # floor as well -- without that floor it re-fires on every step
+                # as the obstacle closes, which took replans from 2.5 a run to
+                # 18.8 and collapsed placement. Stand down when the path clears.
+                worse = (depth > last_depth + REPLAN_WORSE_BY
+                         and t - last_replan >= REPLAN_MIN_GAP)
+                if ttc is None:
+                    engaged, last_depth = False, 0.0
+                elif (not engaged and t - last_replan >= REPLAN_MIN_GAP) or worse:
+                    fn = deform_minimal if strategy == "predictive" else deform_optimise
+                    traj, dev, _, cleared = fn(
                         traj, times, t, tracker, base_radius=base_radius,
                         n_sigma=n_sigma, clearance=clearance, horizon=ttc_threshold,
-                        sigma_cap=sigma_cap, lock_before=i, allow=allow)
+                        sigma_cap=sigma_cap, lock_before=i, allow=allow,
+                        carrying=holding)
                     deviation += dev
                     replans += 1
                     last_replan = t
+                    engaged, last_depth = not cleared, depth
 
 
         data.ctrl[arm_act] = traj[i]
@@ -250,9 +291,19 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
             trace.append(dict(t=t, i=i, q=traj[i].copy(), obstacle=p_rel.copy(),
                               clearance=d_true, replans=replans,
                               cube_z=float(data.xpos[cube_bid][2]),
+                              cube_off=float(np.linalg.norm(
+                                  (data.xpos[cube_bid] - np.array([0.,0.,BASE_Z]))[:2]
+                                  - fk_tcp_pos(traj[i])[:2])),
                               track_err=float(np.linalg.norm(data.qpos[adr] - traj[i]))))
         if renderer is not None and len(frames) * render_stride <= _step:
             renderer.update_scene(data, camera=cam)
+            # Draw the plan the controller is currently following, and the
+            # nominal it started from, so a deformation is visible instead of
+            # having to be inferred from the arm twitching. Without this the
+            # two runs look identical: the whole difference between them is a
+            # path the render does not show.
+            _draw_path(renderer.scene, nominal[i:], NOMINAL_RGBA)
+            _draw_path(renderer.scene, traj[i:], PLAN_RGBA)
             frames.append(dict(px=renderer.render().copy(), t=t, clearance=d_true,
                                replans=replans, hit=d_true <= 0.0))
         t += dt
@@ -264,11 +315,15 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
     # placed() compares against world coordinates; subtracting the base height
     # here scored a cube sitting exactly on target as 0.18 m too low.
     ok, xy_err, dz = placed(data.xpos[cube_bid])
+    from predictive_replanning.cell import PLACE_XY as _PXY
+    land = (float(data.xpos[cube_bid][0] - _PXY[0]),
+            float(data.xpos[cube_bid][1] - _PXY[1]))
     return dict(strategy=strategy,
                 success=bool(ok and not hit_obstacle and worst_env < 0.005),
                 placed=bool(ok), hit_obstacle=hit_obstacle,
                 env_penetration=round(worst_env, 5),
                 place_xy_err=round(xy_err, 4), place_dz=round(dz, 4),
+                land_dx=round(land[0], 4), land_dy=round(land[1], 4),
                 min_clearance=round(min_clear, 4), replans=replans,
                 deviation=round(deviation, 4),
                 path_len=round(float(np.abs(np.diff(traj, axis=0)).sum()), 4),
