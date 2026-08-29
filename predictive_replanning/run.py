@@ -1,12 +1,17 @@
-"""Closed-loop MuJoCo runs, one row per (strategy, seed).
+"""Closed-loop MuJoCo runs, one row per (strategy, obstacle track).
 
-Everything is driven off the seed: the obstacle process, the measurement noise
-the tracker sees, and nothing else. Two strategies on the same seed therefore
-meet the *same* obstacle trajectory, which is the only way the difference
-between them is attributable to the strategy rather than to luck. The
-ME5250 report's results were explicitly "qualitative observations from
-development testing rather than rigorous experimental trials"; these are
-paired trials with a denominator.
+Every strategy is replayed against the *same recorded obstacle motion*, drawn
+from the OS entropy pool rather than reproduced from a seed. A seed only
+delivers a paired comparison as a side effect of nothing else touching the
+generator in between, which is a property of the whole program rather than of
+the experiment -- two strategies that draw a different number of random numbers
+diverge silently, and the tell is a comparison that looks fine and means
+nothing. Recording the motion, measurement noise included, makes the pairing
+the thing it claims to be.
+
+The ME5250 report's results were explicitly "qualitative observations from
+development testing rather than rigorous experimental trials"; these are paired
+trials with a denominator.
 
 A run succeeds when the cube is on the place table. Avoidance alone is not
 success -- an arm that freezes also never collides, and a run that dodges
@@ -42,10 +47,10 @@ import mujoco
 import numpy as np
 
 from predictive_replanning.cell import PICK_TABLE, PLACE_XY, build_mjcf, CUBE_XY
-from predictive_replanning.obstacle import ObstacleProcess
+from predictive_replanning.obstacle import Track, load_tracks, record_tracks, save_tracks
 from predictive_replanning.predict import ObstacleTracker, arm_points, time_to_collision
 from predictive_replanning.replan import deform_minimal, soft_mask
-from predictive_replanning.task import GRIP_OPEN, pick_and_place, placed, solve
+from predictive_replanning.task import pick_and_place, placed, solve
 
 BASE_Z = 0.18                       # base_link height in the MJCF
 STRATEGIES = ("none", "reactive", "predictive")
@@ -63,22 +68,59 @@ def _arm_qpos_adr(model):
 
 
 
-def run_one(strategy: str, seed: int, *, dt: float = 0.02, base_radius: float = 0.07,
+#: The compiled model, keyed on obstacle radius. Building it parses 55 meshes,
+#: which at a hundred-odd trials dominates the run and was enough to get a
+#: batch killed for memory. The model is immutable across trials -- only MjData
+#: changes -- so it is compiled once and reset per run.
+_MODEL_CACHE: dict[float, "mujoco.MjModel"] = {}
+
+
+def _model_for(radius: float):
+    if radius not in _MODEL_CACHE:
+        _MODEL_CACHE[radius] = mujoco.MjModel.from_xml_string(
+            build_mjcf(obstacle_radius=radius))
+    return _MODEL_CACHE[radius]
+
+
+def carry_centre() -> tuple[np.ndarray, float, int]:
+    """Where the obstacle should wander, and how long a run lasts.
+
+    Computed from the nominal plan once so every track in a batch is drawn
+    against the same geometry, and so the tracks can be recorded before any
+    strategy runs.
+    """
+    q_home = np.array([0.0, -1.2, 1.4, -1.6, -1.5708, 0.0])
+    traj, times, _, deformable, _ = solve(pick_and_place(), q_home)
+    carry = np.where(deformable)[0]
+    mid = arm_points(traj[carry[len(carry) // 2]])[0][6] + np.array([0.0, 0.0, BASE_Z])
+    return mid, float(times[-1]), len(traj)
+
+
+def make_tracks(n: int, *, dt: float = 0.02, radius: float = 0.07,
+                theta: float = 1.4, sigma: float = 0.28,
+                meas_std: float = 0.02) -> list[Track]:
+    """A batch of obstacle motions for a comparison. No seeds: drawn from the
+    OS entropy pool, then replayed identically for every strategy."""
+    mid, duration, _ = carry_centre()
+    return record_tracks(n, steps=int(duration / dt) + 60, dt=dt, centre=mid,
+                         box_half=(0.45, 0.55, 0.30), radius=radius,
+                         theta=theta, sigma=sigma, meas_std=meas_std)
+
+
+def run_one(strategy: str, track: Track, *, dt: float = 0.02,
             n_sigma: float = 1.0, clearance: float = 0.02, ttc_threshold: float = 2.0,
             preempt_dist: float = 0.20, sigma_cap: float = 0.10,
             meas_std: float = 0.02, cooldown: float = 0.5,
-            obstacle_theta: float = 3.0, obstacle_sigma: float = 0.9,
             trace: list | None = None, frames: list | None = None,
             render_stride: int = 4, res: tuple[int, int] = (480, 640)) -> dict:
-    model = mujoco.MjModel.from_xml_string(build_mjcf(obstacle_radius=base_radius))
+    base_radius = track.radius
+    model = _model_for(base_radius)
     data = mujoco.MjData(model)
     adr = _arm_qpos_adr(model)
     nid = lambda t, n: mujoco.mj_name2id(model, t, n)
     mocap = model.body_mocapid[nid(mujoco.mjtObj.mjOBJ_BODY, "obstacle")]
     obst_geom = nid(mujoco.mjtObj.mjOBJ_GEOM, "obstacle_g")
-    weld_id = nid(mujoco.mjtObj.mjOBJ_EQUALITY, "grasp_0")
     cube_bid = nid(mujoco.mjtObj.mjOBJ_BODY, "cube_0")
-    hande_bid = nid(mujoco.mjtObj.mjOBJ_BODY, "hande")
     arm_geoms = [g for g in range(model.ngeom)
                  if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").endswith("_col")]
     env_geoms = [nid(mujoco.mjtObj.mjOBJ_GEOM, n)
@@ -92,14 +134,14 @@ def run_one(strategy: str, seed: int, *, dt: float = 0.02, base_radius: float = 
     if renderer is not None:
         cam = mujoco.MjvCamera()
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        cam.lookat[:] = (-0.55, 0.12, 0.48)
-        cam.distance, cam.azimuth, cam.elevation = 2.05, 158.0, -16.0
+        cam.lookat[:] = (-0.52, 0.16, 0.44)
+        cam.distance, cam.azimuth, cam.elevation = 1.85, 108.0, -22.0
 
     q_home = np.array([0.0, -1.2, 1.4, -1.6, -1.5708, 0.0])
     try:
-        traj, times, grip, deformable, weld = solve(pick_and_place(), q_home)
+        traj, times, grip, deformable, holding = solve(pick_and_place(), q_home)
     except RuntimeError as exc:
-        return dict(strategy=strategy, seed=seed, ik_failed=True, why=str(exc))
+        return dict(strategy=strategy, ik_failed=True, why=str(exc))
     nominal = traj.copy()
     n_way = len(traj)
     duration = float(times[-1])
@@ -124,32 +166,23 @@ def run_one(strategy: str, seed: int, *, dt: float = 0.02, base_radius: float = 
                 worst = min(worst, float(data.contact[c].dist))
         return -worst
 
-    # Obstacle wanders over the carry, which is the stretch that can be moved.
     allow = soft_mask(deformable)
-    carry = np.where(deformable)[0]
-    mid_tcp = arm_points(traj[carry[len(carry) // 2]])[0][6] + np.array([0.0, 0.0, BASE_Z])
-    proc = ObstacleProcess(seed=seed, radius=base_radius, centre=mid_tcp,
-                           box_half=np.array([0.45, 0.55, 0.30]),
-                           theta=obstacle_theta, sigma=obstacle_sigma)
-    rng = np.random.default_rng(seed + 5000)
     tracker = None
 
     for a, v in zip(adr, traj[0]):
         data.qpos[a] = v
     data.ctrl[arm_act] = traj[0]
-    data.ctrl[grip_act] = GRIP_OPEN
+    data.ctrl[grip_act] = grip[0]
     mujoco.mj_forward(model, data)
 
     t, last_replan = 0.0, -1e9
     replans, deviation, min_clear = 0, 0.0, np.inf
     hit_obstacle = False
     worst_env = 0.0
-    welded = False
 
     for _step in range(int(duration / dt) + 60):
-        p = proc.step(dt)
+        p, obs = track.at(_step)
         data.mocap_pos[mocap] = p
-        obs = p + rng.normal(0.0, meas_std, 3)
         tracker = (ObstacleTracker(obs, meas_std=meas_std) if tracker is None
                    else (tracker.update(obs, dt) or tracker))
 
@@ -190,26 +223,6 @@ def run_one(strategy: str, seed: int, *, dt: float = 0.02, base_radius: float = 
                     replans += 1
                     last_replan = t
 
-        # The weld's relative pose has to be written at activation. Left at the
-        # default it welds the two bodies origin-to-origin, which teleports the
-        # cube into the gripper body instead of holding it where the jaws
-        # actually closed on it.
-        if bool(weld[i]) != welded:
-            welded = bool(weld[i])
-            if welded:
-                hpos, hquat = data.xpos[hande_bid], data.xquat[hande_bid]
-                cpos, cquat = data.xpos[cube_bid], data.xquat[cube_bid]
-                hinv = np.zeros(4)
-                mujoco.mju_negQuat(hinv, hquat)
-                rel = np.zeros(3)
-                mujoco.mju_rotVecQuat(rel, cpos - hpos, hinv)
-                relq = np.zeros(4)
-                mujoco.mju_mulQuat(relq, hinv, cquat)
-                model.eq_data[weld_id, :3] = 0.0          # anchor, body2 frame
-                model.eq_data[weld_id, 3:6] = rel
-                model.eq_data[weld_id, 6:10] = relq
-                model.eq_data[weld_id, 10] = 1.0          # torquescale
-            data.eq_active[weld_id] = 1 if welded else 0
 
         data.ctrl[arm_act] = traj[i]
         data.ctrl[grip_act] = grip[i]
@@ -217,7 +230,7 @@ def run_one(strategy: str, seed: int, *, dt: float = 0.02, base_radius: float = 
 
         if trace is not None:
             trace.append(dict(t=t, i=i, q=traj[i].copy(), obstacle=p_rel.copy(),
-                              clearance=d_true, replans=replans, welded=welded,
+                              clearance=d_true, replans=replans,
                               cube_z=float(data.xpos[cube_bid][2]),
                               track_err=float(np.linalg.norm(data.qpos[adr] - traj[i]))))
         if renderer is not None and len(frames) * render_stride <= _step:
@@ -233,7 +246,7 @@ def run_one(strategy: str, seed: int, *, dt: float = 0.02, base_radius: float = 
     # placed() compares against world coordinates; subtracting the base height
     # here scored a cube sitting exactly on target as 0.18 m too low.
     ok, xy_err, dz = placed(data.xpos[cube_bid])
-    return dict(strategy=strategy, seed=seed,
+    return dict(strategy=strategy,
                 success=bool(ok and not hit_obstacle and worst_env < 0.005),
                 placed=bool(ok), hit_obstacle=hit_obstacle,
                 env_penetration=round(worst_env, 5),
@@ -265,33 +278,44 @@ def main() -> None:
                     help="comma-separated TTC thresholds to sweep, e.g. 0.3,0.5,1.0,2.0")
     ap.add_argument("--ttc", type=float, default=2.0, help="TTC threshold, seconds")
     ap.add_argument("--n-sigma", type=float, default=1.0)
-    ap.add_argument("--obstacle-sigma", type=float, default=0.9,
+    ap.add_argument("--obstacle-sigma", type=float, default=0.28,
                     help="OU velocity noise; higher is more erratic")
-    ap.add_argument("--obstacle-theta", type=float, default=3.0,
+    ap.add_argument("--obstacle-theta", type=float, default=1.4,
                     help="OU reversion rate; higher forgets direction faster")
     ap.add_argument("--cooldown", type=float, default=0.5,
                     help="minimum seconds between replans; a real replan is not free")
+    ap.add_argument("--tracks", type=str, default="",
+                    help="replay obstacle motions from this .npz instead of drawing new ones")
+    ap.add_argument("--save-tracks", type=str, default="",
+                    help="write the drawn motions here so the run can be repeated exactly")
     ap.add_argument("--json", type=str, default="")
     args = ap.parse_args()
 
+    if args.tracks:
+        tracks = load_tracks(args.tracks)[:args.trials]
+    else:
+        tracks = make_tracks(args.trials, theta=args.obstacle_theta,
+                             sigma=args.obstacle_sigma)
+    if args.save_tracks:
+        save_tracks(tracks, args.save_tracks)
+    print(f"{len(tracks)} obstacle tracks, RMS speed "
+          f"{np.mean([t.rms_speed for t in tracks]):.3f} m/s "
+          f"(theta {tracks[0].theta}, sigma {tracks[0].sigma})"
+          + (f", replayed from {args.tracks}" if args.tracks else "") + "\n")
+
     if args.sweep_ttc:
-        print(f"{'ttc':<8}{'success':<10}{'placed':<9}{'no hit':<9}"
+        print(f"{'ttc':<12}{'success':<10}{'placed':<9}{'no hit':<9}"
               f"{'min clear':<12}{'replans':<10}{'path/nominal'}")
-        base = [run_one("none", s, obstacle_theta=args.obstacle_theta,
-                        obstacle_sigma=args.obstacle_sigma) for s in range(args.trials)]
-        print(_row("none", base))
+        print(_row("none", [run_one("none", tk) for tk in tracks]))
         for ttc in [float(x) for x in args.sweep_ttc.split(",")]:
-            g = [run_one("predictive", s, ttc_threshold=ttc, n_sigma=args.n_sigma,
-                         cooldown=args.cooldown, obstacle_theta=args.obstacle_theta,
-                         obstacle_sigma=args.obstacle_sigma) for s in range(args.trials)]
-            g = [r for r in g if not r.get("ik_failed")]
-            print(_row(f"{ttc}", g))
+            g = [run_one("predictive", tk, ttc_threshold=ttc, n_sigma=args.n_sigma,
+                         cooldown=args.cooldown) for tk in tracks]
+            print(_row(f"{ttc}", [r for r in g if not r.get("ik_failed")]))
         return
 
-    rows = [run_one(s, seed, ttc_threshold=args.ttc, n_sigma=args.n_sigma,
-                    cooldown=args.cooldown, obstacle_theta=args.obstacle_theta,
-                    obstacle_sigma=args.obstacle_sigma)
-            for s in STRATEGIES for seed in range(args.trials)]
+    rows = [run_one(s, tk, ttc_threshold=args.ttc, n_sigma=args.n_sigma,
+                    cooldown=args.cooldown)
+            for s in STRATEGIES for tk in tracks]
     rows = [r for r in rows if not r.get("ik_failed")]
 
     print(f"{'strategy':<12}{'success':<10}{'placed':<9}{'no hit':<9}"

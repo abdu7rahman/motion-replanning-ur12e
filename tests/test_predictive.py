@@ -24,7 +24,8 @@ from predictive_replanning.obstacle import ObstacleProcess           # noqa: E40
 from predictive_replanning.predict import arm_points, ObstacleTracker  # noqa: E402
 from predictive_replanning.replan import (_window, deform_minimal,    # noqa: E402
                                           nominal_trajectory, soft_mask)
-from predictive_replanning.task import pick_and_place, placed, solve  # noqa: E402
+from predictive_replanning.task import (grip_grasp, grip_open,       # noqa: E402
+                                        pick_and_place, placed, solve)
 
 PASS, FAIL = "  PASS", "  FAIL"
 _results = []
@@ -93,7 +94,9 @@ def test_point_jacobian():
 
 def test_ou_closed_form():
     """The forecast the predictor is scored against has to be right itself."""
-    proc = ObstacleProcess(seed=1)
+    # A test wants a fixed motion, so it passes a seeded generator. That is
+    # the caller's choice now rather than something the process imposes.
+    proc = ObstacleProcess(rng=np.random.default_rng(1))
     for _ in range(300):
         proc.step(0.01)
     proc.box_half = np.array([9.0, 9.0, 9.0])          # walls off; closed form has none
@@ -101,7 +104,7 @@ def test_ou_closed_form():
     mean, std = proc.true_forecast(H)
     samples = {h: [] for h in H}
     for k in range(1500):
-        q = ObstacleProcess(seed=90_000 + k)
+        q = ObstacleProcess(rng=np.random.default_rng(90_000 + k))
         q.pos, q.vel, q.box_half = proc.pos.copy(), proc.vel.copy(), proc.box_half
         t, todo = 0.0, list(H)
         while todo:
@@ -145,7 +148,7 @@ def test_deformation_contract():
 
 def test_tracker_is_not_told_the_truth():
     """The filter must estimate velocity it was never given."""
-    proc = ObstacleProcess(seed=4)
+    proc = ObstacleProcess(rng=np.random.default_rng(4))
     rng = np.random.default_rng(4)
     trk = None
     for _ in range(200):
@@ -201,9 +204,8 @@ def test_task_reaches_every_phase():
         reached = ur12e.fk_tcp_pos(traj[(n + 1) * 14 - 1])
         worst = max(worst, float(np.linalg.norm(reached - ph.tcp)))
     check("all eight phases reachable", worst < 1e-3, f"max TCP error {worst:.2e} m")
-    check("grasp closes before the carry", grip[weld][0] > 0.02)
-    check("attachment spans lift to place, not the grasp settle",
-          not weld[28] and weld[int(np.argmax(weld))])
+    check("jaws are closed while carrying", float(np.max(grip[weld])) < float(np.max(grip)))
+    check("carrying starts at the lift, after the close settles", not weld[28])
 
 
 def test_deformation_cannot_trade_the_task():
@@ -215,6 +217,38 @@ def test_deformation_cannot_trade_the_task():
     step = np.max(np.abs(np.diff(m)))
     check("mask has no cliff into a locked phase", step <= 1.0 / 8 + 1e-9,
           f"largest step {step:.4f}")
+
+
+def test_gripper_is_derived_not_typed():
+    """Jaw commands must come from the object, and the sense must be right.
+
+    Travel 0 is CLOSED and 0.025 is a 50 mm opening -- the gap is exactly twice
+    the travel, measured off the vendor collision meshes. An earlier version had
+    open and closed the wrong way round, which together with fingers that
+    carried no collision geometry is why nothing could be picked up.
+    """
+    from predictive_replanning.cell import CUBE_HALF
+    w = 2.0 * CUBE_HALF
+    check("open clears the object", 2 * grip_open(w) > w,
+          f"gap {2 * grip_open(w):.4f} m vs object {w:.4f} m")
+    check("grasp squeezes the object", 2 * grip_grasp(w) < w,
+          f"gap {2 * grip_grasp(w):.4f} m vs object {w:.4f} m")
+    check("open is wider than grasp", grip_open(w) > grip_grasp(w))
+    check("both inside the Hand-E stroke",
+          0.0 <= grip_grasp(w) and grip_open(w) <= 0.025)
+    wide = grip_open(0.06)
+    check("a bigger object opens the jaws wider or saturates", wide >= grip_open(w))
+
+
+def test_fingers_can_actually_collide():
+    """Every finger needs collision geometry, and there must be no weld."""
+    model = mujoco.MjModel.from_xml_string(build_mjcf())
+    fingers = [g for g in range(model.ngeom)
+               if "finger_col" in (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or "")]
+    check("fingers have collision geoms", len(fingers) >= 2, f"{len(fingers)} geoms")
+    check("and they are collidable", all(model.geom_contype[g] for g in fingers))
+    check("the grasp is contact, not a weld", model.neq == 0,
+          f"neq={model.neq}")
 
 
 def test_placed_criterion():
@@ -232,7 +266,8 @@ def main():
     for fn in (test_fk_matches_mujoco, test_reach_matches_the_datasheet_geometry,
                test_tcp_frame, test_point_jacobian, test_ou_closed_form,
                test_deformation_contract, test_deformation_cannot_trade_the_task,
-               test_task_reaches_every_phase, test_placed_criterion,
+               test_task_reaches_every_phase, test_gripper_is_derived_not_typed,
+               test_fingers_can_actually_collide, test_placed_criterion,
                test_tracker_is_not_told_the_truth):
         print(f"\n{fn.__name__}")
         fn()

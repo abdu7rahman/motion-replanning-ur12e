@@ -30,17 +30,37 @@ import numpy as np
 from predictive_replanning.cell import CUBE_HALF, CUBE_XY, PICK_TABLE, PLACE_TABLE, PLACE_XY
 from predictive_replanning.ur12e import ik_tcp
 
-GRIP_OPEN, GRIP_CLOSED = 0.0, 0.022      # Hand-E travel is 0 .. 0.025 m
+# Hand-E finger travel is 0 .. 0.025 m per finger, and the jaw gap measured off
+# the vendor's own collision meshes is exactly twice it: travel 0 is CLOSED and
+# 0.025 is a 50 mm opening. An earlier version had these the wrong way round,
+# which is half of why nothing could be picked up -- the other half being that
+# the fingers carried no collision geometry at all.
+#
+# So the commands are derived from the object, not typed in. The jaws touch a
+# box of width w at travel w/2; open clears it by GRIP_CLEARANCE and the grasp
+# command sits GRIP_SQUEEZE inside the faces, which with a force-limited
+# actuator is what produces grip force instead of penetration.
+GRIP_SPAN_PER_TRAVEL = 2.0
+GRIP_CLEARANCE = 0.008          # m of gap either side when open
+GRIP_SQUEEZE = 0.0025           # m the command goes inside each face
+
+
+def grip_open(width: float) -> float:
+    return min(0.025, width / GRIP_SPAN_PER_TRAVEL + GRIP_CLEARANCE)
+
+
+def grip_grasp(width: float) -> float:
+    return max(0.0, width / GRIP_SPAN_PER_TRAVEL - GRIP_SQUEEZE)
 
 
 @dataclass
 class Phase:
     name: str
     tcp: np.ndarray
-    grip: float
+    grip: float               # commanded finger travel, metres
     seconds: float
     deformable: bool          # may the replanner move this stretch?
-    weld: bool                # is the cube attached during it?
+    holding: bool             # is the cube expected to be in the jaws?
 
 
 def pick_and_place(cube: int = 0) -> list[Phase]:
@@ -55,32 +75,29 @@ def pick_and_place(cube: int = 0) -> list[Phase]:
         return np.array([x, y, z - base_z])
 
     grasp_z = pick_top + CUBE_HALF          # jaws centred on the cube
+    width = 2.0 * CUBE_HALF
+    op, cl = grip_open(width), grip_grasp(width)
     return [
-        Phase("approach", at(cx, cy, pick_top + 0.16), GRIP_OPEN, 1.6, True, False),
-        Phase("descend", at(cx, cy, grasp_z), GRIP_OPEN, 1.2, False, False),
-        # weld=False here on purpose. The jaws close during this phase and the
-        # arm settles; engaging the attachment on its first waypoint captured
-        # the cube while the controller was still 0.075 rad from the commanded
-        # pose, and that offset rode all the way through to a placement 4 cm
-        # off target -- most of the 6 cm budget spent before the carry even
-        # started. The attachment engages at the lift instead.
-        Phase("grasp", at(cx, cy, grasp_z), GRIP_CLOSED, 1.0, False, False),
-        Phase("lift", at(cx, cy, pick_top + 0.24), GRIP_CLOSED, 1.2, True, True),
-        Phase("transfer", at(px, py, place_top + 0.24), GRIP_CLOSED, 3.0, True, True),
-        Phase("place", at(px, py, place_top + CUBE_HALF + 0.004), GRIP_CLOSED, 1.4, False, True),
-        Phase("release", at(px, py, place_top + CUBE_HALF + 0.004), GRIP_OPEN, 0.6, False, False),
-        Phase("retreat", at(px, py, place_top + 0.20), GRIP_OPEN, 1.2, False, False),
+        Phase("approach", at(cx, cy, pick_top + 0.16), op, 1.6, True, False),
+        Phase("descend", at(cx, cy, grasp_z), op, 1.4, False, False),
+        # The jaws close here and the arm settles before anything is lifted.
+        Phase("close", at(cx, cy, grasp_z), cl, 1.0, False, False),
+        Phase("lift", at(cx, cy, pick_top + 0.24), cl, 1.4, True, True),
+        Phase("transfer", at(px, py, place_top + 0.24), cl, 3.0, True, True),
+        Phase("place", at(px, py, place_top + CUBE_HALF + 0.006), cl, 1.6, False, True),
+        Phase("release", at(px, py, place_top + CUBE_HALF + 0.006), op, 0.8, False, False),
+        Phase("retreat", at(px, py, place_top + 0.20), op, 1.2, False, False),
     ]
 
 
 def solve(phases: list[Phase], q_home, *, per_phase: int = 14):
     """Chain the phases into one joint trajectory.
 
-    Returns (traj, times, grip, deformable, weld) sampled at the same rate, so
-    the controller reads one index and gets every command for that instant.
+    Returns (traj, times, grip, deformable, holding) sampled at the same rate,
+    so the controller reads one index and gets every command for that instant.
     """
     q = np.array(q_home, dtype=float)
-    traj, times, grip, deform, weld = [], [], [], [], []
+    traj, times, grip, deform, holding = [], [], [], [], []
     t = 0.0
     for ph in phases:
         q_goal, ok, err = ik_tcp(ph.tcp, q)
@@ -93,11 +110,11 @@ def solve(phases: list[Phase], q_home, *, per_phase: int = 14):
             times.append(t + u[k] * ph.seconds)
             grip.append(ph.grip)
             deform.append(ph.deformable)
-            weld.append(ph.weld)
+            holding.append(ph.holding)
         t += ph.seconds
         q = q_goal
     return (np.asarray(traj), np.asarray(times), np.asarray(grip),
-            np.asarray(deform, dtype=bool), np.asarray(weld, dtype=bool))
+            np.asarray(deform, dtype=bool), np.asarray(holding, dtype=bool))
 
 
 def placed(cube_pos, *, xy_tol: float = 0.06) -> tuple[bool, float, float]:

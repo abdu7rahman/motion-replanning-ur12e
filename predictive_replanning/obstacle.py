@@ -38,7 +38,13 @@ import numpy as np
 
 @dataclass
 class ObstacleProcess:
-    """A seeded OU-velocity obstacle confined to a box."""
+    """An OU-velocity obstacle confined to a box.
+
+    Takes a generator rather than a seed. Callers that want a reproducible
+    motion pass a seeded generator; callers that want a real random draw pass
+    nothing. Owning a seed here made every consumer inherit reproducibility it
+    had not asked for, and made it look like the experiment depended on one.
+    """
 
     centre: np.ndarray = field(default_factory=lambda: np.array([-0.70, 0.10, 0.55]))
     box_half: np.ndarray = field(default_factory=lambda: np.array([0.26, 0.40, 0.22]))
@@ -58,10 +64,11 @@ class ObstacleProcess:
     sigma: float = 0.9              # m/s^(3/2), velocity noise
     mu: np.ndarray = field(default_factory=lambda: np.zeros(3))
     radius: float = 0.09
-    seed: int = 0
+    rng: np.random.Generator | None = None
 
     def __post_init__(self) -> None:
-        self.rng = np.random.default_rng(self.seed)
+        if self.rng is None:
+            self.rng = np.random.default_rng()
         self.pos = self.centre.astype(float).copy()
         self.vel = self.rng.normal(0.0, 0.12, 3)
 
@@ -100,3 +107,86 @@ class ObstacleProcess:
             h - 2.0 * (1.0 - e) / self.theta + (1.0 - np.exp(-2.0 * self.theta * h)) / (2.0 * self.theta)
         )
         return mean, np.sqrt(np.maximum(var, 0.0))
+
+
+@dataclass
+class Track:
+    """One recorded obstacle motion, and the observations of it.
+
+    Seeds were the wrong interface. What a paired comparison needs is that
+    every strategy meets the *same obstacle motion*, and a seed only delivers
+    that as a side effect of nothing else touching the generator in between --
+    which is a property of the whole program, not of the experiment. Two
+    strategies that draw a different number of random numbers silently diverge,
+    and the tell is a comparison that looks fine and means nothing.
+
+    A track is the motion itself. It is drawn once from the OS entropy pool, so
+    it is genuinely random rather than a fixed list of integers, and then
+    replayed. Measurement noise is recorded with it, so the two strategies also
+    see identical observations and the only difference left between two runs is
+    the strategy.
+    """
+
+    positions: np.ndarray            # (N, 3) where the obstacle really was
+    observations: np.ndarray         # (N, 3) what the tracker was shown
+    dt: float
+    radius: float
+    theta: float
+    sigma: float
+
+    def __len__(self) -> int:
+        return len(self.positions)
+
+    def at(self, step: int) -> tuple[np.ndarray, np.ndarray]:
+        k = min(step, len(self.positions) - 1)
+        return self.positions[k], self.observations[k]
+
+    @property
+    def rms_speed(self) -> float:
+        v = np.diff(self.positions, axis=0) / self.dt
+        return float(np.sqrt(np.mean(np.sum(v ** 2, axis=1))))
+
+
+def record_track(*, steps: int, dt: float, centre, box_half, radius: float,
+                 theta: float, sigma: float, meas_std: float,
+                 rng: np.random.Generator | None = None) -> Track:
+    """Draw one obstacle motion. Entropy from the OS unless a generator is given."""
+    rng = rng or np.random.default_rng()
+    # One generator for the whole batch, handed down rather than reseeded.
+    proc = ObstacleProcess(centre=np.asarray(centre, float),
+                           box_half=np.asarray(box_half, float),
+                           theta=theta, sigma=sigma, radius=radius, rng=rng)
+    pos = np.empty((steps, 3))
+    for k in range(steps):
+        pos[k] = proc.step(dt)
+    obs = pos + rng.normal(0.0, meas_std, pos.shape)
+    return Track(positions=pos, observations=obs, dt=dt, radius=radius,
+                 theta=theta, sigma=sigma)
+
+
+def record_tracks(n: int, **kw) -> list[Track]:
+    """A batch of independent motions, all from one entropy draw."""
+    rng = np.random.default_rng()
+    return [record_track(rng=rng, **kw) for _ in range(n)]
+
+
+def save_tracks(tracks: list[Track], path) -> None:
+    """Write a batch to disk.
+
+    This is how a number in the README stays checkable without a seed. The
+    motions themselves are the record; anyone can replay the exact obstacles a
+    result was measured against, which a seed only promises as long as nothing
+    else in the program draws from the same generator.
+    """
+    np.savez_compressed(
+        path,
+        positions=np.stack([t.positions for t in tracks]),
+        observations=np.stack([t.observations for t in tracks]),
+        meta=np.array([[t.dt, t.radius, t.theta, t.sigma] for t in tracks]))
+
+
+def load_tracks(path) -> list[Track]:
+    z = np.load(path)
+    return [Track(positions=p, observations=o, dt=float(m[0]), radius=float(m[1]),
+                  theta=float(m[2]), sigma=float(m[3]))
+            for p, o, m in zip(z["positions"], z["observations"], z["meta"])]

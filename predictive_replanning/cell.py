@@ -18,7 +18,7 @@ payload, and using UR10e geometry is what the vendor does, not a substitution.
 The ME5250 write-up records MuJoCo being tried first and dropped over
 ros2_control segfaults and bridge timing. None of that applies here: there is
 no bridge, the planner and controller share a process, and the physics steps
-deterministically under a seed -- which is what makes the trials comparable.
+against a recorded obstacle motion, which is what makes the trials comparable.
 
 Body origins are emitted as quaternions rather than euler angles. URDF rpy is
 extrinsic XYZ; MuJoCo's default eulerseq is intrinsic xyz. They agree for every
@@ -85,6 +85,31 @@ def _box(name, centre, half, rgba):
             f'size="{half[0]} {half[1]} {half[2]}" rgba="{rgba}"/>')
 
 
+# The cube deliberately carries no friction or solref of its own. MuJoCo takes
+# the element-wise maximum of the two geoms' friction, so the jaws already
+# govern the grasp, and adding a softer solref to the cube "for documentation"
+# measurably lost it -- the demo went from placed to dropped. Contact tuning
+# lives on the fingers, in one place, where it is doing work.
+
+
+def _finger_collision(prefix: str, prov: dict, indent: str) -> str:
+    """The Hand-E's own collision mesh on each finger.
+
+    These were missing entirely: every finger geom was visual-only, so the jaws
+    passed through the cube and a grasp was impossible. finger_collision.dae
+    ships in the description package and was already being converted and then
+    not used. High friction and a soft contact pair, because a parallel jaw
+    holding a box is a friction grasp and MuJoCo's defaults are too slippery to
+    hold one against the accelerations of a carry.
+    """
+    out = []
+    for n, part in enumerate(prov["hande_finger_collision"]["parts"]):
+        out.append(f'<geom name="{prefix}_{n}" type="mesh" mesh="{Path(part["mesh"]).stem}" '
+                   f'group="3" rgba="0 0 0 0" friction="2.0 0.05 0.001" '
+                   f'solref="0.004 1" solimp="0.95 0.99 0.001" condim="4"/>')
+    return f"\n{indent}".join(out)
+
+
 def _provenance(asset_dir: Path) -> dict:
     return json.loads((asset_dir / "PROVENANCE.json").read_text())["files"]
 
@@ -113,7 +138,7 @@ def _mesh_geoms(prefix: str, key: str, offset: dict, prov: dict, *, visual: bool
     return f"\n{indent}  ".join(out)
 
 
-def build_mjcf(*, obstacle_radius: float = 0.09, seed_cubes: bool = True,
+def build_mjcf(*, obstacle_radius: float = 0.09, with_cubes: bool = True,
                asset_dir: Path | None = None) -> str:
     asset_dir = Path(asset_dir or ASSET_DIR)
     if not (asset_dir / "PROVENANCE.json").exists():
@@ -160,19 +185,21 @@ def build_mjcf(*, obstacle_radius: float = 0.09, seed_cubes: bool = True,
         f'range="{h["grip_min"]} {h["grip_max"]}"/>'
         f'\n{g}        <inertial pos="0 0 0.01" mass="{h["finger_mass"]}" diaginertia="1e-6 1e-6 1e-6"/>'
         f'\n{g}        {_mesh_geoms("left_finger_vis", "hande_finger", {}, prov, visual=True, indent=g + "        ")}'
+        f'\n{g}        {_finger_collision("left_finger_col", prov, g + "        ")}'
         f'\n{g}      </body>'
         f'\n{g}      <body name="right_finger" pos="0 0 {h["hande_height"]}" quat="0 0 0 1">'
         f'\n{g}        <joint name="hande_right_finger_joint" type="slide" axis="1 0 0" '
         f'range="{h["grip_min"]} {h["grip_max"]}"/>'
         f'\n{g}        <inertial pos="0 0 0.01" mass="{h["finger_mass"]}" diaginertia="1e-6 1e-6 1e-6"/>'
         f'\n{g}        {_mesh_geoms("right_finger_vis", "hande_finger", {}, prov, visual=True, indent=g + "        ")}'
+        f'\n{g}        {_finger_collision("right_finger_col", prov, g + "        ")}'
         f'\n{g}      </body>'
         f'\n{g}      <site name="tcp" pos="0 0 {h["hande_height"] + 0.0465}" size="0.008" rgba="1 0 0 1"/>'
         f'\n{g}    </body>'
         f'\n{g}  </body>')
 
     cubes = ""
-    if seed_cubes:
+    if with_cubes:
         cz = PICK_TABLE["centre"][2] + PICK_TABLE["half"][2] + CUBE_HALF
         for i, (cx, cy) in enumerate(CUBE_XY):
             cubes += (f'\n    <body name="cube_{i}" pos="{cx} {cy} {cz}">'
@@ -223,21 +250,15 @@ def build_mjcf(*, obstacle_radius: float = 0.09, seed_cubes: bool = True,
     </body>
   </worldbody>
 
-  <!-- Grasp as an equality constraint rather than friction. The ME5250 report
-       records the alternative: "the cube seems to not be physically attached in
-       simulation, occasionally resulting in dropped objects during transport".
-       Tuning contact friction until a box stays in the jaws would make every
-       success rate below a statement about that tuning. A weld says plainly
-       that a successful grasp is assumed and the thing being measured is
-       whether the arm gets the object there. -->
-  <equality>
-    <weld name="grasp_0" body1="hande" body2="cube_0" active="false" solref="0.01 1"/>
-  </equality>
-
   <actuator>
 {chr(10).join(f'    <position name="act_{j}" joint="{j}" kp="3000" dampratio="1"/>' for j in JOINTS)}
-    <position name="act_grip_l" joint="hande_left_finger_joint" kp="200" dampratio="1"/>
-    <position name="act_grip_r" joint="hande_right_finger_joint" kp="200" dampratio="1"/>
+    <!-- Force-limited, so commanding the jaws past the cube's face squeezes it
+         rather than driving through it. This is what makes the grasp a grasp:
+         the fingers close until they meet the object and then hold it. -->
+    <position name="act_grip_l" joint="hande_left_finger_joint" kp="900" dampratio="1"
+              forcerange="-130 130"/>
+    <position name="act_grip_r" joint="hande_right_finger_joint" kp="900" dampratio="1"
+              forcerange="-130 130"/>
   </actuator>
 </mujoco>
 """
