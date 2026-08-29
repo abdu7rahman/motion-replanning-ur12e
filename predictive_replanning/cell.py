@@ -248,12 +248,21 @@ def build_mjcf(*, obstacle_radius: float = 0.09, with_cubes: bool = True,
     {_box("place_table", PLACE_TABLE["centre"], PLACE_TABLE["half"], "0.55 0.42 0.30 1")}
 {cubes}
 
-    <!-- The moving obstacle. mocap, because its motion is prescribed by the
-         random process in obstacle.py rather than by contact: an obstacle the
-         arm could shove aside is not the obstacle being studied. -->
+    <!-- The moving obstacle. Mocap, so its path is the one obstacle.py
+         recorded and the arm cannot shove it aside -- that is the point of
+         studying avoidance rather than a wrestling match.
+
+         It DOES collide. It was contype 0 before, which meant it swept through
+         the arm and a "collision" was only ever a number in a log: the run
+         carried on undisturbed and the cube arrived as if nothing had touched
+         it. Now the contact is real, so being hit knocks the arm off its
+         trajectory and the task fails the way it would on hardware. The
+         clearance figure is unchanged -- still mj_geomDistance against the
+         collision meshes -- but now it has consequences attached. -->
     <body name="obstacle" mocap="true" pos="-0.70 0.18 0.55">
       <geom name="obstacle_g" type="sphere" size="{obstacle_radius}"
-            rgba="0.20 0.75 0.30 0.55" contype="0" conaffinity="0"/>
+            rgba="0.20 0.75 0.30 0.55" contype="1" conaffinity="1"
+            friction="0.6 0.02 0.001" solref="0.008 1" condim="3"/>
     </body>
 
     <body name="base_link" pos="0 0 0.18">

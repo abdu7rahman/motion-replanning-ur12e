@@ -209,10 +209,21 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
     n_way = len(traj)
     duration = float(times[-1])
 
-    def true_clearance() -> float:
-        """Surface-to-surface, obstacle against every arm collision mesh."""
+    cube_geom = nid(mujoco.mjtObj.mjOBJ_GEOM, "cube_0_g")
+
+    def true_clearance(carrying: bool) -> float:
+        """Surface-to-surface, obstacle against the arm -- and the cube it holds.
+
+        The carried object is part of what has to be protected. With the
+        obstacle given real contact it knocks the cube straight out of the jaws
+        without going near a link, and in 8 runs of 30 that scored as
+        "untouched" while the task failed: the arm was clean and the cube was on
+        the floor. While nothing is held the cube is excluded, or a box sitting
+        on the bench would count as a near miss.
+        """
+        geoms = arm_geoms + ([cube_geom] if carrying else [])
         return min(float(mujoco.mj_geomDistance(model, data, obst_geom, g, 2.0, None))
-                   for g in arm_geoms)
+                   for g in geoms)
 
     def env_penetration() -> float:
         """Deepest arm-into-furniture overlap right now, 0 when clear.
@@ -255,7 +266,7 @@ def run_one(strategy: str, track: Track, *, dt: float = 0.02,
 
         p_rel = p - np.array([0.0, 0.0, BASE_Z])
         mujoco.mj_forward(model, data)
-        d_true = true_clearance()
+        d_true = true_clearance(bool(holding[i]))
         min_clear = min(min_clear, d_true)
         if d_true <= 0.0:
             hit_obstacle = True
