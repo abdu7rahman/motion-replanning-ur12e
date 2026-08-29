@@ -120,232 +120,253 @@ thickness. That is the next thing worth fixing here.
 
 # Predictive replanning, in MuJoCo
 
-Everything above is Strategy 1 — replan once the obstacle is already there. The
+Everything above is Strategy 1 -- replan once the obstacle is already there. The
 ME5250 write-up this repo grew out of lists Strategy 2 under future work:
 *"implement time-to-collision estimation for moving obstacles, triggering
 replanning before collision becomes imminent rather than after detection."*
-That is what `predictive_replanning/` is, at the project proposal's own
-TTC < 2 s threshold, against an obstacle whose motion is random and has to be
-estimated rather than known.
+This is that, plus the Strategy 3 the proposal also named, against an obstacle
+that goes for the arm on purpose and reaches it every time.
 
 It runs without ROS. The write-up records MuJoCo being tried first and dropped
 over `ros2_control` segfaults and bridge timing; none of that applies here
-because there is no bridge — planner and controller share a process, and the
-physics steps deterministically under a seed, which is what makes paired trials
-comparable.
+because there is no bridge -- planner and controller share a process, and every
+strategy is replayed against the same recorded obstacle motions.
 
-![no replanning: the obstacle reaches the arm](docs/img/nominal.gif)
+## The result
 
-No replanning. The arm picks the cube and carries it, the obstacle crosses the
-transfer, and surface clearance goes to **−0.0354 m** — contact. The cube still
-lands on the table, which is the point of scoring both things separately.
+Ninety recorded obstacle motions, every strategy replayed against the same ones.
+The obstacle reaches the arm in all ninety if nothing gets out of the way, so
+every trial is a real conflict rather than a coin flip about whether one
+happened. Success is the cube on the place table **and** nothing touched.
 
-![predictive replanning at TTC 0.3 s](docs/img/predictive.gif)
+| strategy | untouched | placed | success | mean clearance | replans | path / nominal |
+|---|---|---|---|---|---|---|
+| no replanning | 0/90 | 6/90 | 0/90 | −0.038 m | 0.0 | 1.00x |
+| reactive | 4/90 | 11/90 | 2/90 | −0.033 m | 3.9 | 1.03x |
+| predictive, TTC 0.5 s | 15/90 | 28/90 | 12/90 | −0.018 m | 4.2 | 1.18x |
+| predictive, TTC 1.0 s | **37/90** | 17/90 | 13/90 | **+0.026 m** | 5.0 | 1.49x |
+| local optimisation, TTC 0.5 s | 11/90 | 17/90 | 10/90 | −0.027 m | 4.1 | 1.24x |
+| local optimisation, TTC 1.0 s | 31/90 | **35/90** | **25/90** | −0.005 m | 4.7 | 1.33x |
 
-The same recorded obstacle motion with prediction on. One replan, closest
-approach **+0.0684 m**, and the cube is placed. That is a success; the run
-above is not — and it is worth saying up front that only **2 of 120** tracks
-look like this. The aggregate below is the honest picture.
+Paired on the same motions, by McNemar's exact test:
 
-## The cell is the vendor's, not a sketch
+- **Reactive replanning is not distinguishable from doing nothing.** Success
+  +2/−0 (p = 0.50), untouched +4/−0 (p = 0.12). Against an obstacle that is
+  coming *at* the arm, waiting until it is 0.2 m away leaves no room to move.
+  The report said as much qualitatively; this is the denominator behind it.
+- **Predicting where it will be works.** Every predictive and optimising
+  configuration beats the baseline on all three columns, none of them loses a
+  single paired trial on avoidance, and the smallest p-value in that block is
+  2 × 10⁻³.
+- **The best configuration is Strategy 3 with a one-second horizon**: 25/90
+  successes against 0/90, p = 6 × 10⁻⁸, and it beats the single-point
+  deformation at the same horizon on success (+5/−17, p = 0.017).
+- **Horizon buys avoidance and spends the payload.** Predictive at 1.0 s is
+  untouched 37 times to 15 at 0.5 s (+22/−0, p = 5 × 10⁻⁷) and places 17 times
+  to 28. Its path is 1.49x nominal: it is dodging hard, and a hard dodge shakes
+  a friction grasp. Spreading the same correction over every threatened
+  waypoint, which is what Strategy 3 does, is how the 1.0 s horizon gets kept
+  without the placements being paid for it.
 
-Meshes, masses and centres of mass come from
-`Universal_Robots_ROS2_Description` at a pinned commit, and the gripper from
-`robotiq_hande_description` — the same package this repo's own
-`ur12e_hande.urdf.xacro` includes. `assets/PROVENANCE.json` records the commit
-and a SHA-256 for every file used.
+Two things that are *not* the explanation, both checked rather than assumed.
+Grip force: sweeping Robotiq's rated range, 20 N to 130 N (actuator gain 8 000
+to 52 000), moves placement by one run in twelve. The payload speed bound:
+1.10x, 1.20x and 1.35x are within a run of each other, because a tighter bound
+clears less per replan and simply fires more of them. What loses the cube is the
+shape of the deformation, not how hard the jaws squeeze or how fast the tool is
+allowed to move.
 
-Two things the description package settles that are easy to guess wrong:
-`config/ur12e/default_kinematics.yaml` is **byte-identical** to `ur10e`, and
-`config/ur12e/visual_parameters.yaml` names `meshes/ur10e/...` for every link —
-there is no `meshes/ur12e/` at all. So a UR12e is a UR10e rated for more
-payload, and using UR10e geometry is what the vendor does rather than a
-substitution made here. `config/ur16e` differs (`a2 = -0.4784`), which is what
-makes the identical files a statement about the robots and not about the repo.
-UR's public DH table does not list the UR12e at all, so the obvious place to
-look comes up empty.
+## Six runs, one obstacle motion
 
-Meshes are split by material rather than merged: a UR forearm alone binds four
-(LinkGrey 0.82, JointGrey 0.278, Black 0.033, URBlue 0.49/0.678/0.8), and
-flattening them to one colour per link throws the arm's actual appearance away.
+All six are the same recorded motion, so the only difference is the strategy.
+Grey is the plan before replanning, red is the plan the controller is actually
+following; a deformation is the red path bending away from the grey.
 
-## What the obstacle does, and what the robot knows
+![no replanning](docs/img/nominal.gif)
+Hit at −0.034 m. The obstacle arrives at the tool, and the cube ends up 0.84 m
+from the target.
 
-Obstacle velocity is an Ornstein-Uhlenbeck process — mean-reverting, so the
-path is smooth and bounded like a hand reaching into a cell rather than a
-random walk. `sigma` is set so the stationary RMS speed is 0.29 m/s, inside the
-0.2–0.5 m/s band reported for human reach in collaborative cells, and its
-forward mean and variance are known in closed form. That closed form is checked
-against 4000 Monte-Carlo rollouts, so the predictor is scored against a truth
-with a right answer rather than against its own residuals.
+![reactive](docs/img/reactive.gif)
+Fires twice once the obstacle is close, and is hit anyway at −0.025 m. Two
+replans is not a small effort spent well; it is the whole budget spent late.
 
-The robot is **not** told that process. It tracks noisy positions with a
-constant-velocity Kalman filter — deliberately the wrong model — and avoids not
-a predicted point but a tube, `r + n_sigma * sigma(h)`, that widens with the
-horizon.
+![predictive TTC 0.5](docs/img/predictive_ttc0.5.gif)
+Three replans, clears by +0.086 m, places the cube 10.6 mm from target.
+
+![predictive TTC 1.0](docs/img/predictive_ttc1.0.gif)
+Same three replans, a second of lead instead of half: clears by +0.185 m, more
+than twice the margin, and still places at 21.4 mm.
+
+![local optimisation TTC 0.5](docs/img/optimise_ttc0.5.gif)
+Two replans and hit at −0.022 m. Spreading a correction over the threatened
+waypoints needs lead time to spread it over; half a second is not enough, which
+is the aggregate result too (11/90 untouched against 31/90 at 1.0 s).
+
+![local optimisation TTC 1.0](docs/img/optimise_ttc1.0.gif)
+Clears by +0.082 m and places at 8.9 mm -- the tightest placement of the six.
+This is the configuration the table picks.
+
+## The obstacle goes for the arm
+
+Earlier versions had it wander in a box near the workspace. It only sometimes
+drifted into the path, so most trials posed no conflict at all and the
+comparison largely measured how often the obstacle happened to be elsewhere. It
+also gave the predictor nothing worth predicting: a mean-reverting wander has no
+intent to estimate, so the filter's velocity carried almost no information about
+where the obstacle would be when it mattered.
+
+It now loiters clear of the arm, then closes on the tool path the arm follows
+**if nothing replans**, solving the interception forwards at every step -- the
+earliest future step whose recorded tool position is within reach at its closing
+speed, aim there. Doing nothing is a collision by construction, and only
+deviating escapes.
+
+Getting from "sets off in roughly the right direction" to "arrives" took three
+corrections, each found by measuring rather than by watching it:
+
+- **It aimed at a commanded waypoint** while the controller lagged the command,
+  and landed 0.11 to 0.16 m in front of the tool. It aims at the pose the
+  simulator actually reached.
+- **It chased the arm's current position.** A tail chase against a moving target
+  arrives behind it, and about a third of the trials passed harmlessly astern.
+  Leading the target is the whole difference: the error it steers on is now the
+  distance to where the arm *will be* when it gets there.
+- **It loitered wherever the standoff put it**, which on some draws was 3.6 cm
+  from the tool at t = 0 -- already touching the robot before it set off, a
+  collision no replanner could have avoided. Candidates are now drawn until one
+  loiters clear of the arm's whole approach and above the benches.
+
+Closest approach to the tool is 0.008 m median and 0.016 m worst against a
+0.07 m sphere, and the do-nothing baseline is hit 90 times out of 90.
+
+It is still random in the ways that matter to the predictor: where it loiters,
+which direction it comes from, how far away it starts, how fast it closes, when
+it sets off, and OU noise the whole way, so it neither travels a straight line
+the tracker could extrapolate for free nor arrives exactly where it aimed. What
+is no longer random is *whether there is anything to avoid*.
+
+It also has to leave. Parking in the cell after the crossing turned the intruder
+into furniture -- the arm came through the carry clean and then reversed into a
+stationary sphere during the retreat. Carrying straight on sent it down through
+the bench and the floor. Retracting to where it loitered took it back across the
+corridor it had just crossed, so every trial posed the conflict twice and
+avoidance halved across every strategy, which is a fact about the obstacle
+rather than about replanning. It follows through on its incoming heading,
+levelled so it never exits downwards, and that is one crossing.
+
+Because it chases a *recorded* path it cannot react to a replan, so an arm that
+moves early genuinely gets away rather than fighting an omniscient pursuer. A
+test displaces the path by 25 cm along the direction the replanner pushes and
+checks that every draw misses it.
+
+## Three things the measurements were lying about
+
+The first table this repo produced said replanning improved avoidance and hurt
+the task. It was wrong three times over, and none of the three was visible in
+the numbers -- each had to be found by checking a quantity against something
+that already knew the answer.
+
+**The clearance metric covered one collision geom out of eleven.** They were
+selected with `endswith("_col")`. UR ships one collision mesh per link and the
+loader splits meshes by material, so those geoms come out `<link>_col_0`; only
+the Hand-E shell, a primitive, is a bare `hande_col`. That one matched. The
+shoulder, forearm, both wrists and all four finger pads were invisible, and the
+arm could be driven through the obstacle without the number moving.
+
+**The simulator ran at a tenth of the rate everything else believed.** The
+control loop stepped `mj_step` once per iteration at the model's 2 ms timestep
+while the controller, the recorded obstacle and the clock all advanced 20 ms. The
+arm was handed its next waypoint ten times too soon and lagged the command by up
+to 0.64 rad, while the obstacle -- placed by mocap, so immune to the mismatch --
+crossed the cell at ten times its stated speed. Stepping a whole control period
+per iteration takes the tracking error to 0.035 rad mean, 0.19 worst.
+
+**The planner thought the robot was a wire.** Its collision check is a point
+skeleton and the points carried no thickness, so a plan that cleared the
+obstacle by 2 cm of skeleton was four centimetres inside it. Over 4 000 random
+poses and obstacle placements the skeleton overstated true surface-to-surface
+clearance by 0.065 m on average and 0.28 m at worst. Each point now carries its
+own link's shaft radius, read off the vendor collision meshes and re-derived from
+the compiled model by a test; the same sample now *understates* clearance by
+0.021 m on average, which is the direction a safety margin is supposed to err in.
+
+That last one is the bug the ROS half of this repo still has, in a different
+place: the self-filter's capsule model is "two numbers for an arm whose links
+are not all the same thickness". The note calling that the next thing worth
+fixing was written before this section existed.
+
+## Collisions cost something
+
+The obstacle used to be `contype="0"`. It swept through the arm and a collision
+was only a number in a log: the run carried on undisturbed and the cube arrived
+as though nothing had happened, so *avoided* and *hit* produced the same outcome
+and no success rate could tell them apart.
+
+It collides now. Being hit knocks the arm off its trajectory and the task fails
+the way it would on hardware. That exposed a blind spot in the metric: with real
+contact the obstacle knocks the carried cube straight out of the jaws without
+going near a link, and in 8 runs of 30 the arm was clean, the cube was on the
+floor, and the run scored as untouched. Clearance covers the cube while it is
+held -- and "held" is checked against the simulator, not the plan, because the
+plan believes it is carrying from the moment the jaws close, so a cube already on
+the floor stayed in the metric and the obstacle drifting past it later scored as
+a second collision with the arm nowhere near.
 
 ## The grasp is a grasp
 
-The jaws open, close on the cube and hold it by friction. There is no weld and
-no attachment constraint; `neq == 0` and a test asserts it.
+The jaws open, close on the cube and hold it by friction. No weld, `neq == 0`,
+and a test asserts it. Two things had to be true and neither was: every finger
+geom was visual-only so the jaws passed through the cube, and open and closed
+were inverted -- measured off the vendor meshes the jaw gap is exactly twice the
+finger travel, so travel 0 is *closed*. Commands are derived from the object:
+jaws touch a box of width `w` at travel `w/2`, open clears it by 8 mm, and the
+grasp sits 2.5 mm inside each face against an actuator geared to Robotiq's rated
+force. Left at a round gain the model produced 2.2 N against a rating of 20 to
+185 N. It runs at 20 N, the bottom of that range, because the sweep above shows
+the rest of the range does not buy anything.
 
-Two things had to be true for that to work, and neither was:
+## The tool is vertical, everywhere
 
-- **The fingers had no collision geometry.** Every finger geom was visual-only,
-  `contype=0`, so the jaws passed through the cube. `finger_collision.dae`
-  ships in the description package and was already being converted and then
-  never used.
-- **Open and closed were the wrong way round.** Measured off the vendor
-  collision meshes, the jaw gap is exactly twice the finger travel: travel 0 is
-  **closed** and 0.025 is a 50 mm opening. The commands were the other way up.
+IK was position-only, which is a modelling error rather than a simplification.
+Minimum-norm steps move whichever joints are cheapest, so the shoulder did
+nearly all the work, the elbow swung 0.27 rad against the shoulder's 0.93, and
+wrist_3 never moved at all -- it cannot change a position, so a position-only
+task gave it nothing to do. Nothing held the tool upright either: the gripper
+reached the cube 36.6 degrees off vertical.
 
-The commands are now derived from the object rather than typed in. Jaws touch a
-box of width `w` at travel `w/2`; open clears it by 8 mm and the grasp command
-sits 2.5 mm inside each face, which against a force-limited actuator is what
-produces grip force instead of penetration. For the 40 mm cube that is a 50 mm
-opening and a 35 mm squeeze.
-
-This matters for the result rather than only for realism. With a weld,
-replanning was free with respect to the payload. With a friction grasp it is
-not, and that is the whole finding below.
+Every phase now commands a full pose and the trajectory is solved in task space,
+because interpolating joint angles between two solved poses pinned the tool only
+at the endpoints and let it swing 9.8 degrees off vertical in between. Tool tilt
+is 0.043 degrees at worst across every waypoint of every rendered run. The
+deformation holds it there too -- it used to push through a translational
+Jacobian, which is free to rotate the wrist, and tilting a gripper mid-carry is
+how a friction grasp drops what it is holding.
 
 ## No seeds
 
-Every strategy is replayed against the **same recorded obstacle motion**, drawn
-from the OS entropy pool. A seed only delivers a paired comparison as a side
-effect of nothing else touching the generator in between — a property of the
-whole program, not of the experiment. Two strategies that draw a different
-number of random numbers diverge silently, and the tell is a comparison that
-looks fine and means nothing.
+Every strategy is replayed against the same recorded obstacle motion, drawn from
+the OS entropy pool. A seed only delivers a paired comparison as a side effect of
+nothing else touching the generator in between, which is a property of the whole
+program rather than of the experiment. A track is the motion itself, measurement
+noise included. Tracks save and reload (`--save-tracks`, `--tracks`);
+`tests/tracks/chase90.npz` is the batch the table was measured on and
+`tests/tracks/demo.npz` is the single motion behind the six GIFs.
 
-A track is the motion itself, measurement noise included, so the only
-difference between two runs is the strategy. Tracks save and reload
-(`--save-tracks`, `--tracks`), which is how the numbers below stay checkable
-without a seed: `tests/tracks/calm120.npz` is the batch they were measured on.
+n = 30 is not enough here and was actively misleading: one batch of 30 put
+Strategy 3 at 7/30 against predictive's 4/30 at the same horizon, and the sign of
+that gap is the opposite of what 90 trials give. Everything above is n = 90.
 
-## Success is the cube on the place table
+## The cell is the vendor's
 
-Not "the arm survived". An arm that freezes also never collides, and a run that
-dodges perfectly and drops the cube has failed at the job. Clearance is
-`mj_geomDistance`, surface-to-surface against UR's own collision meshes on the
-state the simulator actually reached; zero is touching.
-
-## Where the obstacle is
-
-In the middle of the pick-to-place corridor, at the halfway point of the
-transfer, taken at the tool centre point: (−0.62, 0.12, 0.61) in world frame.
-The box around it is tight — 0.12 m across the path, 0.22 m along it — so the
-obstacle stays in the way rather than wandering somewhere the arm never goes.
-
-Three earlier versions of this were wrong in ways that all flattered the
-result. It centred on the **wrist origin** rather than the TCP, putting the
-hazard 15 cm behind the part of the arm carrying the cube. It averaged over
-every deformable waypoint, approach included, which drags the centre back
-toward the pick table. And the box was opened to (0.45, 0.55, 0.30) to
-manufacture headroom, which mostly bought distance: "avoided" came to mean
-"was never a threat", and the comparison measured how far away the obstacle
-was rather than how well anything replanned.
-
-## The planner could not see its own gripper
-
-The skeleton the replanner checks stopped at wrist_3. The last **0.156 m** of
-the robot — the whole Hand-E, and whatever it is holding — was invisible to it:
-the part furthest from the base, and the part nearest the obstacle during a
-carry. Against an obstacle sitting in the corridor the replanner fired 1.2
-times a run and moved the path 1.002x nominal, which reads like a tuning
-problem and is not one.
-
-The chain now runs to the TCP. On the same recorded tracks that doubled the
-replan count and moved reactive from 84 to 86 successes.
-
-## Results, 120 recorded tracks
-
-Obstacle at 0.285 m/s RMS, in the corridor, same motions replayed for every row.
-
-| strategy | success | placed | never touched | min clearance | replans | path / nominal |
-|---|---|---|---|---|---|---|
-| none | **83/120** | 120/120 | 83/120 | 0.0225 m | 0 | 1.00x |
-| reactive | 86/120 | 117/120 | 88/120 | 0.0259 m | 2.3 | 1.03x |
-| predictive, TTC 0.3 s | 79/120 | 110/120 | 86/120 | 0.0291 m | 2.7 | 1.09x |
-
-And across the horizon:
-
-| TTC | success | placed | never touched | min clearance | path / nominal |
-|---|---|---|---|---|---|
-| none | **83/120** | 120/120 | 83/120 | 0.0225 m | 1.00x |
-| 0.3 s | 79/120 | 110/120 | 86/120 | 0.0291 m | 1.09x |
-| 0.5 s | 70/120 | 96/120 | 85/120 | 0.0313 m | 1.23x |
-| 1.0 s | 36/120 | 47/120 | **95/120** | **0.0413 m** | 1.63x |
-| 2.0 s | 14/120 | 21/120 | 82/120 | 0.0369 m | 2.07x |
-
-**No setting beats doing nothing.** Placement falls monotonically — 120, 110,
-96, 47, 21 — and success falls with it. At TTC 1.0 s the arm is untouched in 95
-runs against the baseline's 83, and it drops the cube in 73 of them.
-
-## Is any of that real? Paired McNemar, n=120
-
-The tracks are paired, so the marginals above understate what can be tested.
-Counting the runs where exactly one of the two strategies succeeded:
-
-| comparison | baseline only | strategy only | p |
-|---|---|---|---|
-| reactive vs none, success | 1 | 4 | 0.375 |
-| predictive 0.3 s vs none, success | 6 | 2 | 0.289 |
-| **predictive 1.0 s vs none, success** | **53** | **6** | **<0.0001** |
-| reactive vs none, untouched | 0 | 5 | 0.063 |
-| predictive 0.3 s vs none, untouched | 0 | 3 | 0.250 |
-| **predictive 1.0 s vs none, untouched** | **8** | **20** | **0.036** |
-
-So the one statement this experiment supports at any confidence is a
-double-edged one: **at a 1 s horizon, predictive replanning is significantly
-better at avoiding the obstacle (p = 0.036) and significantly worse at the job
-(p < 0.0001).** Everything else — reactive, short-horizon prediction — is
-indistinguishable from doing nothing, and the tables above should be read that
-way rather than as a ranking.
-
-That is a negative result for the method as implemented here. It is also the
-result the project proposal's own framing could not have produced: scored on
-collisions alone, TTC 1.0 s is the best row in the table.
-
-## Why looking further ahead stops helping
-
-The robot is not told the obstacle's process. It tracks noisy positions with a
-constant-velocity Kalman filter — deliberately the wrong model — and avoids not
-a predicted point but a tube, `r + n_sigma * sigma(h)`, widening with the
-horizon. Mean forecast error against a 0.19 m tube:
-
-| horizon | 0.3 s | 0.5 s | 1.0 s | 2.0 s |
-|---|---|---|---|---|
-| forecast error | 0.075 m | 0.123 m | 0.254 m | 0.529 m |
-
-Between 0.5 s and 1.0 s the prediction leaves the tube meant to contain it. A
-constant-velocity filter also extrapolates without bound: its 2 s covariance
-implies a sphere 2.40 m across against a true mean error of 0.98 m, which would
-mark the whole workspace blocked, so the tube saturates at a cap the cell knows
-from its own obstacle bounds.
-
-## Moving as little as possible
-
-Replanning deforms the existing path rather than regenerating one. The
-offending point is pushed out by its penetration depth plus a margin, through a
-Jacobian built for *that* point — pushing the tool when the forearm is what is
-inside moves the wrong part of the arm — spread over a raised-cosine window
-pinned to zero at both ends. Start and goal are preserved exactly, executed
-waypoints are frozen, and the precision phases are untouchable.
-
-Three constraints the task imposed, each found by a run failing rather than by
-reading code:
-
-- **Gating when a replan fires is not enough.** The window is eight waypoints
-  wide and reached into the next phase; a reactive run placed the cube **0
-  times out of 25** before the mask existed.
-- **The mask ramps rather than cuts.** A hard 0/1 edge let the last free
-  waypoint move while the first locked one could not, shifting the grasp pose
-  and putting the cube 7–8 cm off a 6 cm tolerance — placed, scored a failure,
-  nothing in the trajectory looking wrong.
-- **Rate limiting is load-bearing.** Without one replan per 0.5 s the trigger
-  fires every timestep, deformations compound, and the path reaches **45x**
-  nominal.
+Meshes, masses and centres of mass from `Universal_Robots_ROS2_Description` at a
+pinned commit, gripper from `robotiq_hande_description` -- the package this
+repo's own xacro already includes. `assets/PROVENANCE.json` records a SHA-256 per
+file. Two things that package settles: `config/ur12e/default_kinematics.yaml` is
+byte-identical to `ur10e`, and `config/ur12e/visual_parameters.yaml` names
+`meshes/ur10e/...` for every link. There is no `meshes/ur12e/` at all, so a UR12e
+is a UR10e rated for more payload. `config/ur16e` differs, which is what makes
+the identical files a statement about the robots rather than the repo. Meshes are
+split by material, because a forearm binds four.
 
 ## Running it
 
@@ -357,40 +378,47 @@ git clone --depth 1 https://github.com/UniversalRobots/Universal_Robots_ROS2_Des
 git clone --depth 1 https://github.com/AGH-CEAI/robotiq_hande_description.git third_party/hande_description
 .venv/bin/python -m predictive_replanning.assets        # DAE/STL -> MuJoCo, with provenance
 
-.venv/bin/python tests/test_predictive.py               # 34 checks
-.venv/bin/python -m predictive_replanning.run --trials 120 --ttc 0.3 --tracks tests/tracks/corridor120.npz
-.venv/bin/python -m predictive_replanning.run --trials 120 --sweep-ttc 0.3,0.5,1.0,2.0 --tracks tests/tracks/corridor120.npz
-.venv/bin/python -m predictive_replanning.run --trials 60 --save-tracks /tmp/new.npz   # fresh random motions
+.venv/bin/python tests/test_predictive.py               # 67 checks
+.venv/bin/python -m predictive_replanning.run --trials 90 --ttc 1.0 --tracks tests/tracks/chase90.npz
+.venv/bin/python -m predictive_replanning.run --trials 90 --sweep-ttc 0.3,0.5,1.0,2.0 --tracks tests/tracks/chase90.npz
 ```
 
+`--wander` swaps the intercepting obstacle for the box-confined one, which is
+what the earlier tables were measured against.
+
 Rendering needs a GL backend. On a headless box that is OSMesa, a **system**
-package — pip cannot supply it, and without it MuJoCo fails inside PyOpenGL
-with `'NoneType' object has no attribute 'glGetError'`, an error naming neither
-MuJoCo nor the missing library. On a bare image `apt-get update` has to run
-first or the install simply does not find it:
+package -- pip cannot supply it, and without it MuJoCo fails inside PyOpenGL with
+`'NoneType' object has no attribute 'glGetError'`, an error naming neither MuJoCo
+nor the missing library. On a bare image `apt-get update` has to run first or the
+install simply does not find it:
 
 ```bash
 apt-get update && apt-get install -y libosmesa6
 ```
 
-`third_party/`, `assets/` and `.venv/` are gitignored — all derived or fetched,
-and `assets/PROVENANCE.json` pins what they came from.
+`third_party/`, `assets/` and `.venv/` are gitignored -- derived or fetched, and
+`assets/PROVENANCE.json` pins what they came from.
 
 ## What this is not
 
-- **No perception.** The obstacle's position is read from the recorded track
-  with Gaussian noise added. The RealSense pipeline above is not in this loop.
-- **The planner's collision check is a skeleton**, joint origins plus samples
-  down each shaft to the TCP, because it runs over every future waypoint on
-  every step. Only the reported clearance uses the real meshes, so the planner
-  is never scored on its own simplification.
+- **No perception.** The obstacle's position comes from the recorded track with
+  Gaussian noise added. The RealSense pipeline above is not in this loop.
+- **The planner's collision check is still a skeleton**, joint origins plus
+  samples down each shaft to the TCP, now with a per-link radius. It runs over
+  every future waypoint on every step, so it stays an approximation; the reported
+  clearance uses the real meshes, and the planner is never scored on its own
+  simplification.
+- **The retiming is spatial only.** A deformation moves where the arm goes, not
+  when it gets there, so the only way to buy clearance is to move further in the
+  same time. Slowing down to let the obstacle pass is not in the search space,
+  and it is the obvious next thing to add.
 - **One cube.** The other two are scenery.
-- **Strategy 3 is still not implemented.** CHOMP/TrajOpt-style local
-  optimisation remains future work, as it was in the write-up.
+- **n = 90.** Enough to separate every strategy from the baseline and to order
+  the two deformations at a one-second horizon; not enough to split 12 from 13.
 
 ## What is untouched
 
 `reactive_replanning_ur12e/`, `config/`, `launch/`, `package.xml` and the
-original detection tests are not modified by any of this. The only change
-outside new files is one line in `setup.py` excluding this package from the
-ament build, so `colcon build` does not pull MuJoCo into a ROS install.
+original detection tests are not modified by any of this. The only change outside
+new files is one line in `setup.py` excluding this package from the ament build,
+so `colcon build` does not pull MuJoCo into a ROS install.
